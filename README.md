@@ -462,58 +462,13 @@ The .NET driver has these features, and this driver does not have them yet:
 - OpenTelemetry traces and metrics,
 - HTTP/3.
 
-## Development
+## Contributing
 
-```shell
-uv sync
-uv run pytest                     # unit tests; the integration tests are skipped
-uv run ruff check . && uv run ruff format --check . && uv run mypy
-```
-
-The integration tests need a server. Each run creates its own database and drops it at the end:
-
-```shell
-CAMUSDB_TEST_ENDPOINT=http://localhost:5095 uv run pytest
-
-# The authentication tests need a server with CAMUSDB_AUTH_ENABLED=true and a superuser.
-CAMUSDB_TEST_AUTH_ENDPOINT=http://localhost:5095 CAMUSDB_TEST_AUTH_USER=admin \
-CAMUSDB_TEST_AUTH_PASSWORD=... uv run pytest tests/test_integration_auth.py
-```
-
-## CI and releases
-
-GitHub Actions runs `.github/workflows/ci.yml` on each push to `main` and on each pull request:
-
-| Job | What it does |
-| --- | --- |
-| Lint & type check | `ruff check`, `ruff format --check` and `mypy`. |
-| Unit tests | `pytest` on Python 3.10 to 3.14. |
-| Integration tests | The integration tests against `camusdb/camusdb:latest` in Docker, on Python 3.10 and 3.14. |
-| Integration tests (authentication) | The authentication tests against the same image with `CAMUSDB_AUTH_ENABLED=true`. The job skips them, with a notice, when the image has no authentication. |
-| Build distributions | `uv build`, `twine check`, a test install of the wheel, and the `dist` artifact. |
-
-`.github/workflows/release.yml` publishes a version. It runs when you push a tag that starts with
-`v`. It runs all of CI first, and it then publishes the wheel and the source archive that CI built.
-Thus a push to `main` never publishes anything.
-
-To release:
-
-1. Set the same version in `pyproject.toml` and in `camusdb.__version__`. A unit test makes sure
-   that they agree.
-2. Commit, then push a tag with that version: `git tag v0.2.0 && git push origin v0.2.0`.
-3. The workflow refuses a tag that does not match the version in `pyproject.toml`. It publishes to
-   PyPI, and then creates a GitHub release with the files and generated notes.
-
-Do these steps one time, before the first release:
-
-1. On PyPI, add a trusted publisher for the project `camusdb-py`: owner `camusdb`, repository
-   `camusdb-py`, workflow `release.yml`, environment `pypi`. For a project that is not on PyPI yet,
-   add it as a pending publisher. No API token is stored in GitHub.
-2. In the GitHub repository settings, create the environment `pypi`. To require an approval before
-   each upload, add required reviewers to it.
-
-Dependabot (`.github/dependabot.yml`) proposes updates of the actions and of `uv.lock` each week.
+- [CONTRIBUTING.md](https://github.com/camusdb/camusdb-py/blob/main/CONTRIBUTING.md): the
+  environment, the checks, and how to run the integration tests.
+- [RELEASING.md](https://github.com/camusdb/camusdb-py/blob/main/RELEASING.md): the CI jobs and how
+  to publish a version.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/camusdb/camusdb-py/blob/main/LICENSE).
