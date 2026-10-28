@@ -19,7 +19,7 @@ jobs:
     needs: ci
     environment:
       name: pypi
-      url: https://pypi.org/project/camusdb/
+      url: https://pypi.org/project/camusdb-py/
     permissions:
       # Trusted publishing: PyPI accepts this workflow's OIDC token, so no API token is stored.
       id-token: write

@@ -21,7 +21,7 @@ USER_AGENT = "camusdb-python"
 
 def client_options(config: Config) -> dict[str, Any]:
     if config.http2 and importlib.util.find_spec("h2") is None:
-        raise InterfaceError("HTTP/2 needs the h2 package: pip install 'camusdb[http2]'")
+        raise InterfaceError("HTTP/2 needs the h2 package: pip install 'camusdb-py[http2]'")
     return {
         "http2": config.http2,
         "timeout": config.timeout,

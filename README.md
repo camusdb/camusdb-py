@@ -5,11 +5,12 @@ A Python driver for [CamusDB](https://github.com/camusdb/camusdb). It implements
 `camusdb.aio`. It speaks the server's REST protocol through [httpx](https://www.python-httpx.org/).
 
 ```shell
-pip install camusdb
-pip install 'camusdb[http2]'   # to use HTTP/2
+pip install camusdb-py
+pip install 'camusdb-py[http2]'   # to use HTTP/2
 ```
 
-Python 3.10 or later is necessary.
+The package on PyPI is `camusdb-py`, and the module that you import is `camusdb`. Python 3.10 or
+later is necessary.
 
 ## Quick start
 
@@ -505,7 +506,7 @@ To release:
 
 Do these steps one time, before the first release:
 
-1. On PyPI, add a trusted publisher for the project `camusdb`: owner `camusdb`, repository
+1. On PyPI, add a trusted publisher for the project `camusdb-py`: owner `camusdb`, repository
    `camusdb-py`, workflow `release.yml`, environment `pypi`. For a project that is not on PyPI yet,
    add it as a pending publisher. No API token is stored in GitHub.
 2. In the GitHub repository settings, create the environment `pypi`. To require an approval before
