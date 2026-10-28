@@ -24,7 +24,7 @@ jobs:
       # Trusted publishing: PyPI accepts this workflow's OIDC token, so no API token is stored.
       id-token: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: astral-sh/setup-uv@v6
 
