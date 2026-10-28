@@ -1,0 +1,229 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # The release workflow runs this workflow first, and publishes the wheel that it builds.
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The server the integration tests run against. 5095 is the REST API.
+  CAMUSDB_IMAGE: camusdb/camusdb:latest
+
+jobs:
+  lint:
+    name: Lint & type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: Ruff
+        run: uv run ruff check --output-format github .
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      - name: Mypy
+        run: uv run mypy
+
+  test:
+    name: Unit tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: Test
+        # Without CAMUSDB_TEST_ENDPOINT the integration tests are skipped.
+        run: uv run pytest -ra
+
+  integration:
+    name: Integration tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest and the newest supported versions.
+        python-version: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Start CamusDB
+        run: docker run -d -p 5095:5095 -v camus-data:/data --name camusdb "$CAMUSDB_IMAGE"
+
+      - name: Wait for CamusDB
+        run: bash .github/scripts/wait-for-camusdb.sh camusdb http://localhost:5095
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: Test
+        # Each run creates its own database and drops it at the end.
+        env:
+          CAMUSDB_TEST_ENDPOINT: http://localhost:5095
+        run: uv run pytest -ra tests/test_integration.py
+
+      - name: CamusDB logs
+        if: failure()
+        run: docker logs camusdb || true
+
+      - name: Stop CamusDB
+        if: always()
+        run: docker rm -f camusdb || true
+
+  integration-auth:
+    name: Integration tests (authentication)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+
+      - name: Generate bootstrap credentials
+        # The server has no default account: with authentication on, it needs a bootstrap secret.
+        run: |
+          password="$(openssl rand -base64 24)"
+          echo "::add-mask::$password"
+          echo "CAMUSDB_BOOTSTRAP_PASSWORD=$password" >> "$GITHUB_ENV"
+
+      - name: Start CamusDB with authentication on
+        # --network host, not -p: with authentication on, the server refuses credentials over clear
+        # text except from loopback. Under port mapping the server sees the Docker bridge as the
+        # client, so every login would fail with CADB0519. On the host network the client is 127.0.0.1.
+        run: |
+          docker run -d --network host -v camus-auth-data:/data --name camusdb-auth \
+            -e CAMUSDB_AUTH_ENABLED=true \
+            -e CAMUSDB_AUTH_TOKEN_KEY="$(openssl rand -hex 32)" \
+            -e CAMUSDB_NODE_SECRET="$(openssl rand -hex 32)" \
+            -e CAMUSDB_BOOTSTRAP_USER=admin \
+            -e CAMUSDB_BOOTSTRAP_PASSWORD="$CAMUSDB_BOOTSTRAP_PASSWORD" \
+            "$CAMUSDB_IMAGE"
+
+      - name: Wait for CamusDB
+        run: bash .github/scripts/wait-for-camusdb.sh camusdb-auth http://localhost:5095
+
+      - name: Check that the image supports authentication
+        # An image older than authentication ignores CAMUSDB_AUTH_* and has no /login route. The tests
+        # would then fail for a reason outside this repository, so the job skips them with a notice.
+        id: auth
+        run: |
+          status="$(curl --silent --max-time 10 --output /dev/null --write-out '%{http_code}' \
+            -X POST http://localhost:5095/login -H "Content-Type: application/json" \
+            -d '{"user":"nobody","password":"nobody"}')" || {
+            echo "The server did not answer /login." >&2
+            docker logs camusdb-auth || true
+            exit 1
+          }
+          if [ "$status" = "404" ]; then
+            echo "::notice::$CAMUSDB_IMAGE has no /login route; the authentication tests are skipped."
+            echo "supported=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "supported=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wait for the bootstrap superuser
+        # The server creates the bootstrap user some seconds after it begins to answer /ping, and a
+        # login before that fails with CADB0516. The server permits 20 logins for each account each
+        # minute, so the probe tries at most 10 times, 3 s apart.
+        if: steps.auth.outputs.supported == 'true'
+        run: |
+          body="$(jq -n --arg p "$CAMUSDB_BOOTSTRAP_PASSWORD" '{user: "admin", password: $p}')"
+          for i in $(seq 1 10); do
+            status="$(curl --silent --max-time 10 --output /dev/null --write-out '%{http_code}' \
+              -X POST http://localhost:5095/login -H "Content-Type: application/json" -d "$body" || true)"
+            if [ "$status" = "200" ]; then
+              echo "The bootstrap superuser can log in (attempt $i)."
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "The bootstrap superuser could not log in (last status: $status)." >&2
+          docker logs camusdb-auth || true
+          exit 1
+
+      - name: Install
+        if: steps.auth.outputs.supported == 'true'
+        run: uv sync --locked
+
+      - name: Test
+        if: steps.auth.outputs.supported == 'true'
+        env:
+          CAMUSDB_TEST_AUTH_ENDPOINT: http://localhost:5095
+          CAMUSDB_TEST_AUTH_USER: admin
+          CAMUSDB_TEST_AUTH_PASSWORD: ${{ env.CAMUSDB_BOOTSTRAP_PASSWORD }}
+        run: uv run pytest -ra tests/test_integration_auth.py
+
+      - name: CamusDB logs
+        if: failure()
+        run: docker logs camusdb-auth || true
+
+      - name: Stop CamusDB
+        if: always()
+        run: docker rm -f camusdb-auth || true
+
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+
+      - name: Build
+        run: uv build
+
+      - name: Check metadata
+        run: uvx twine check --strict dist/*
+
+      - name: Install the wheel and import it
+        # Outside the source tree, so the test imports the wheel and not src/.
+        run: |
+          cd "$RUNNER_TEMP"
+          uv venv wheel-check
+          uv pip install --python wheel-check "$GITHUB_WORKSPACE"/dist/*.whl
+          wheel-check/bin/python -c "import camusdb, camusdb.aio; print('camusdb', camusdb.__version__)"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
