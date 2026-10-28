@@ -222,7 +222,7 @@ jobs:
           uv pip install --python wheel-check "$GITHUB_WORKSPACE"/dist/*.whl
           wheel-check/bin/python -c "import camusdb, camusdb.aio; print('camusdb', camusdb.__version__)"
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
