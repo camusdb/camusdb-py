@@ -38,3 +38,7 @@ Things to know about the authentication tests:
   before that fails with `CADB0516`.
 - **The server permits 20 logins for each account each minute.** Two runs within one minute can fail
   with `CADB0518`. Wait one minute, then run again.
+
+`test_backups` runs only when the server has a backup directory (`kahuna.backup_dir`) and accepts the
+backup calls. With authentication off, the server accepts backup calls from loopback only, so under
+Docker port mapping the test is skipped, as in CI.

@@ -278,9 +278,13 @@ def test_backups(conn):
     """A full backup, an incremental on it, and the chain. Needs a server with kahuna.backup_dir."""
     try:
         full = conn.backups.take_full()
-    except camusdb.OperationalError as exc:
+    except camusdb.Error as exc:
         if exc.code == codes.BACKUP_NOT_CONFIGURED:
             pytest.skip("the server has no kahuna.backup_dir")
+        # With authentication off, the server accepts backup calls from loopback only. Under Docker
+        # port mapping, the server does not see the client as loopback.
+        if exc.code == codes.INSUFFICIENT_PRIVILEGE:
+            pytest.skip(f"the server refuses backup calls from this client: {exc.message}")
         raise
     assert full.type == "Full"
     assert full.created_at is not None
