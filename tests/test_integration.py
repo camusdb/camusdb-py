@@ -263,3 +263,38 @@ async def test_async_round_trip(endpoint, database, table):
         conn.autocommit = True
         assert await camusdb.aio.run_transaction(conn, count) == 2
         assert await conn.ping()
+
+
+def test_node_stats(conn):
+    stats = conn.node_stats(conn.endpoints[0])
+    assert stats.address == conn.endpoints[0]
+    assert stats.node.version
+    assert stats.data_volume is not None
+    assert stats.data_volume.total_bytes > 0
+    assert stats.cpu.processor_count > 0
+
+
+def test_backups(conn):
+    """A full backup, an incremental on it, and the chain. Needs a server with kahuna.backup_dir."""
+    try:
+        full = conn.backups.take_full()
+    except camusdb.OperationalError as exc:
+        if exc.code == codes.BACKUP_NOT_CONFIGURED:
+            pytest.skip("the server has no kahuna.backup_dir")
+        raise
+    assert full.type == "Full"
+    assert full.created_at is not None
+
+    incremental = conn.backups.take_incremental(full.backup_id)
+    assert incremental.parent_backup_id == full.backup_id or incremental.was_substituted
+
+    ids = [backup.backup_id for backup in conn.backups.list()]
+    assert full.backup_id in ids
+    assert incremental.backup_id in ids
+
+    chain = conn.backups.chain(incremental.backup_id)
+    assert chain[-1].backup_id == incremental.backup_id
+    assert chain[0].min_recoverable_physical_ms is not None
+
+    preview = conn.backups.preview_garbage_collection()
+    assert preview.applied is False

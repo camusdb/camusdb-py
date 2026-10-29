@@ -10,6 +10,6 @@
             print(row)
 """
 
-from .connection import AsyncConnection, AsyncCursor, connect, run_transaction
+from .connection import AsyncBackups, AsyncConnection, AsyncCursor, connect, run_transaction
 
-__all__ = ["AsyncConnection", "AsyncCursor", "connect", "run_transaction"]
+__all__ = ["AsyncBackups", "AsyncConnection", "AsyncCursor", "connect", "run_transaction"]

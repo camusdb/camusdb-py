@@ -26,6 +26,9 @@ _T = TypeVar("_T")
 
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_TOKEN_LIFETIME = 600.0
+# A full or a coordinated backup copies the base image of a whole node, which takes much longer than
+# a statement.
+DEFAULT_BACKUP_TIMEOUT = 300.0
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,8 @@ class Config:
     autocommit: bool = False
     http2: bool = False
     allow_insecure_credentials: bool = False
+    backup_endpoint: str | None = None
+    backup_timeout: float = DEFAULT_BACKUP_TIMEOUT
 
     def with_database(self, database: str) -> Config:
         return replace(self, database=database)
@@ -70,6 +75,8 @@ _KEYS: dict[str, str] = {
     "http2": "http2",
     "allowinsecurecredentials": "allow_insecure_credentials",
     "protocol": "protocol",
+    "backupendpoint": "backup_endpoint",
+    "backuptimeout": "backup_timeout",
 }
 
 # Keys of the .NET driver that tune features this driver does not have. They are accepted and have
@@ -83,8 +90,6 @@ _IGNORED_KEYS = frozenset(
         "coalescingdelay",
         "requestframes",
         "tracequerytext",
-        "backupendpoint",
-        "backuptimeout",
         "routingmode",
         "routingnodes",
         "routingmaxhintage",
@@ -226,6 +231,10 @@ def build_config(dsn: str | None, overrides: Mapping[str, Any]) -> Config:
         allow_insecure_credentials=_bool(
             "allow_insecure_credentials", settings.pop("allow_insecure_credentials", False)
         ),
+        backup_endpoint=_backup_endpoint(settings.pop("backup_endpoint", None)),
+        backup_timeout=_positive_float(
+            "backup_timeout", settings.pop("backup_timeout", DEFAULT_BACKUP_TIMEOUT)
+        ),
     )
     if config.password is not None and not config.user:
         raise ProgrammingError("a password needs a user", codes.INVALID_INPUT)
@@ -242,7 +251,9 @@ def check_credentials_transport(config: Config) -> None:
         config.password is None and config.access_token is None
     ):
         return
-    for endpoint in config.endpoints:
+    # The backup endpoint gets the same token as the other endpoints.
+    targets = config.endpoints + ((config.backup_endpoint,) if config.backup_endpoint else ())
+    for endpoint in targets:
         parts = urlsplit(endpoint)
         if parts.scheme == "https" or _is_loopback(parts.hostname):
             continue
@@ -290,6 +301,16 @@ def _endpoints(raw: Any) -> tuple[str, ...]:
     if not endpoints:
         raise ProgrammingError("an endpoint is required", codes.INVALID_INPUT)
     return tuple(endpoints)
+
+
+def _backup_endpoint(raw: Any) -> str | None:
+    """One endpoint, used as it is: a backup is node-level, so it is not sent in rotation."""
+    if raw is None or not str(raw).strip():
+        return None
+    endpoints = _endpoints(raw)
+    if len(endpoints) > 1:
+        raise ProgrammingError("backup_endpoint names one node, not a list", codes.INVALID_INPUT)
+    return endpoints[0]
 
 
 def _optional_str(value: Any, *, strip: bool = True) -> str | None:

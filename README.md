@@ -75,6 +75,8 @@ the value in quotes. To include the quote character, write it two times:
 | `http2` | `HttpVersion` (`1.1`, `2`, `3`) | `False` | Use HTTP/2 on an `https://` endpoint. `HttpVersion=3` also gives HTTP/2, because httpx has no HTTP/3. |
 | `token_lifetime` | `TokenLifetime` | `600` | The lifetime of a token, in seconds, when the server reports none. |
 | `allow_insecure_credentials` | `AllowInsecureCredentials` | `False` | See [TLS](#tls). |
+| `backup_endpoint` | `BackupEndpoint` | the next node in rotation | The node that gets the backup calls. See [Backups](#backups). |
+| `backup_timeout` | `BackupTimeout` | `300` | The time limit of each backup call, in seconds. |
 | `row_factory` | | `tuple_row` | See [Rows](#rows). |
 
 The driver accepts the .NET keys that tune features it does not have (`MaxAutoPrepare`,
@@ -375,8 +377,8 @@ conn.execute("GRANT SELECT ON shop.* TO app")
 
 ### TLS
 
-The driver refuses credentials (`password` or `access_token`) for an endpoint that is neither
-`https://` nor this machine (`localhost`, `127.0.0.1`, `::1`). It raises an `InterfaceError` with the
+The driver refuses credentials (`password` or `access_token`) for an endpoint or a `backup_endpoint`
+that is neither `https://` nor this machine (`localhost`, `127.0.0.1`, `::1`). It raises an `InterfaceError` with the
 code `CADB0519` in `connect()`, before anything goes on the network. When TLS ends at a proxy inside
 your trust boundary, set `allow_insecure_credentials=True`.
 
@@ -423,6 +425,62 @@ conn.database = "shop_test"  # use another database on this connection
 Without a name, these methods use the connection's database. A create that collides with another
 create at the same time is retried. A create with `if_not_exists=True` that loses a race succeeds.
 
+### Node statistics
+
+`conn.node_stats()` gives the disk, CPU and memory of one node:
+
+```python
+stats = conn.node_stats()  # the next node in rotation
+for endpoint in conn.endpoints:  # each node answers only for itself
+    stats = conn.node_stats(endpoint)
+    disk = stats.data_volume
+    print(stats.address, disk.available_bytes, disk.below_watermark, stats.cpu.process_cpu_percent)
+```
+
+Every size is in bytes. A value that the node could not read is `-1`, never `0`, and `stats.errors`
+gives the field and the reason. A value that the server did not send is `-1` too. The endpoint must be
+one of `conn.endpoints`, because the driver sends its token only to those nodes.
+
+With authentication on, the user must be a superuser or have the `MONITOR` privilege
+(`GRANT MONITOR ON *.* TO app`). Another user gets a `ProgrammingError` with the code `CADB0517`.
+
+### Backups
+
+`conn.backups` takes, lists and checks backups while the server runs:
+
+```python
+full = conn.backups.take_full()
+incremental = conn.backups.take_incremental(full.backup_id)  # the changes since the parent
+if incremental.was_substituted:
+    log.warning("full backup taken instead: %s", incremental.substitution_reason)
+
+conn.backups.list()  # every backup in the catalog
+chain = conn.backups.chain(incremental.backup_id)  # root first; the server checks the chain
+window = (chain[0].min_recoverable_physical_ms, chain[0].max_recoverable_physical_ms)
+
+conn.backups.preview_garbage_collection()  # what retention would delete; nothing is deleted
+conn.backups.collect_garbage()  # run retention now
+```
+
+- **A backup holds the whole node**, every database on the server, not only the connection's
+  database.
+- **The server must have a backup directory** (`kahuna.backup_dir`). Without one, each call raises an
+  `OperationalError` with the code `CADB0700`.
+- **Authorization.** With authentication on, the connection must log in as a superuser. With
+  authentication off, the server accepts these calls from this machine only.
+- **The node.** The calls go to `backup_endpoint` when you set it, else to the next node in rotation.
+  `conn.backups.take_coordinated()` takes one consistent backup of the cluster, and only the
+  coordinator node accepts it. Another node refuses with `CADB070E`. Set `backup_endpoint` to the
+  coordinator. `backup_endpoint` must be a node of the same deployment, because it gets the
+  connection's token.
+- **The time limit** is `backup_timeout`, 300 seconds by default, because a full backup copies the
+  whole node.
+- **A restore is not in the driver.** A restore writes a new data directory, and an operator must
+  then start a new server on it. See the server's guide to backups and point-in-time recovery.
+
+The backup errors are `OperationalError` with a `CADB07xx` code. `camusdb.codes` names the frequent
+ones.
+
 ## asyncio
 
 `camusdb.aio` has the same interface, with coroutines:
@@ -442,6 +500,9 @@ async with await camusdb.aio.connect("Endpoint=http://localhost:5095;Database=te
         await conn.execute(...)
 
     await camusdb.aio.run_transaction(conn, transfer)  # transfer is an async function
+
+    stats = await conn.node_stats()
+    backup = await conn.backups.take_full()
 ```
 
 ## Thread safety
@@ -458,7 +519,6 @@ The .NET driver has these features, and this driver does not have them yet:
 - prepared statements, explicit or automatic,
 - learned statement routing,
 - pipelined transactions,
-- the backup administration API and node statistics,
 - OpenTelemetry traces and metrics,
 - HTTP/3.
 

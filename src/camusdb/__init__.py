@@ -11,9 +11,21 @@
 """
 
 from . import codes, rows
+from ._admin import (
+    BackupGcDeletion,
+    BackupGcOrphan,
+    BackupGcResult,
+    BackupInfo,
+    CpuStats,
+    DiskVolumeStats,
+    MemoryStats,
+    NodeIdentity,
+    NodeStats,
+    NodeStatsError,
+)
 from ._config import redact as redact_connection_string
 from ._protocol import Branch
-from .connection import Connection, Cursor, connect, run_transaction
+from .connection import Backups, Connection, Cursor, connect, run_transaction
 from .errors import (
     DatabaseError,
     DataError,
@@ -63,21 +75,32 @@ __all__ = [
     "NUMBER",
     "ROWID",
     "STRING",
+    "BackupGcDeletion",
+    "BackupGcOrphan",
+    "BackupGcResult",
+    "BackupInfo",
+    "Backups",
     "Binary",
     "Branch",
     "ColumnType",
     "Connection",
+    "CpuStats",
     "Cursor",
     "DataError",
     "DatabaseError",
     "Date",
     "DateFromTicks",
+    "DiskVolumeStats",
     "Error",
     "IntegrityError",
     "InterfaceError",
     "InternalError",
     "IsolationLevel",
     "Locking",
+    "MemoryStats",
+    "NodeIdentity",
+    "NodeStats",
+    "NodeStatsError",
     "NotSupportedError",
     "ObjectId",
     "OperationalError",

@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import builtins
 import time
+import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from types import TracebackType
 from typing import Any, TypeVar
 
+from . import _admin, codes
 from . import _protocol as proto
-from . import codes
+from ._admin import BackupGcResult, BackupInfo, NodeStats
 from ._base import (
     MAX_FINALIZE_ATTEMPTS,
     ConnectionState,
@@ -28,7 +31,7 @@ from .retry import is_retryable
 from .rows import RowFactory
 from .types import IsolationLevel, Locking
 
-__all__ = ["Connection", "Cursor", "connect", "run_transaction"]
+__all__ = ["Backups", "Connection", "Cursor", "connect", "run_transaction"]
 
 T = TypeVar("T")
 
@@ -49,6 +52,8 @@ def connect(
     http2: bool | None = None,
     token_lifetime: float | None = None,
     allow_insecure_credentials: bool | None = None,
+    backup_endpoint: str | None = None,
+    backup_timeout: float | None = None,
     row_factory: RowFactory | None = None,
 ) -> Connection:
     """Open a connection to CamusDB.
@@ -76,6 +81,8 @@ def connect(
             "http2": http2,
             "token_lifetime": token_lifetime,
             "allow_insecure_credentials": allow_insecure_credentials,
+            "backup_endpoint": backup_endpoint,
+            "backup_timeout": backup_timeout,
         },
     )
     return Connection(config, row_factory=row_factory)
@@ -97,6 +104,7 @@ class Connection:
     def __init__(self, config: Config, *, row_factory: RowFactory | None = None) -> None:
         self._state = ConnectionState(config, row_factory)
         self._transport = Transport(config)
+        self._backups: Backups | None = None
 
     # --- PEP 249 ----------------------------------------------------------------------------------
 
@@ -355,6 +363,24 @@ class Connection:
         body = self._admin(proto.EXECUTE_QUERY, proto.show_ancestors_sql(name or self.database))
         return proto.branches_from(proto.parse_query(body))
 
+    def node_stats(self, endpoint: str | None = None) -> NodeStats:
+        """The disk, CPU and memory of one node.
+
+        Without ``endpoint``, the next node in rotation answers. Each node answers only for itself,
+        so to monitor a cluster, call this one time for each of :attr:`endpoints`.
+        """
+        self._state.check_open()
+        target = _admin.node_endpoint(self.endpoints, endpoint) or self._transport.next_endpoint()
+        body = self._transport.get(_admin.NODE_STATS, endpoint=target, fallback="node stats failed")
+        return _admin.parse_node_stats(body, target)
+
+    @property
+    def backups(self) -> Backups:
+        """The node's backup administration API. See :class:`Backups`."""
+        if self._backups is None:
+            self._backups = Backups(self)
+        return self._backups
+
     def _admin(self, route: str, sql: str) -> dict[str, Any]:
         # A server-level statement: it runs outside the connection's transaction.
         self._state.check_open()
@@ -600,6 +626,104 @@ class Cursor:
 
     def setoutputsize(self, size: Any, column: int | None = None) -> None:
         """Does nothing: results are not truncated."""
+
+
+class Backups:
+    """The node's online backup administration API: take, list, check and expire backups.
+
+    A backup is node-wide. It holds every database on the server, not only the connection's database.
+    The calls go to the connection's ``backup_endpoint`` when it has one, else to the next node in
+    rotation. Each call has the time limit ``backup_timeout``, 300 seconds by default.
+
+    With authentication on, the connection must log in as a superuser. With authentication off, the
+    server accepts these calls from this machine only.
+
+    A restore is not here. It writes a new data directory, and an operator must then start a new
+    server on that directory, so an application cannot complete it.
+    """
+
+    def __init__(self, connection: Connection) -> None:
+        self._connection = connection
+
+    def take_full(self) -> BackupInfo:
+        """Take a full backup: a complete image that restores with no parent."""
+        fallback = "take full backup failed"
+        return _admin.parse_backup(self._post(_admin.BACKUP_FULL, None, fallback), fallback)
+
+    def take_incremental(self, parent_backup_id: str | uuid.UUID) -> BackupInfo:
+        """Take a backup of the changes since ``parent_backup_id``.
+
+        When the parent is older than the retention floor, the server takes a full backup instead.
+        The call succeeds, and :attr:`BackupInfo.was_substituted` is True.
+        """
+        fallback = "take incremental backup failed"
+        body = {"parentBackupId": _admin.backup_id(parent_backup_id, "parent_backup_id")}
+        return _admin.parse_backup(self._post(_admin.BACKUP_INCREMENTAL, body, fallback), fallback)
+
+    def take_coordinated(self) -> BackupInfo:
+        """Take a full backup of the cluster at one consistent cut across every partition.
+
+        Send it to the coordinator node: set ``backup_endpoint`` to that node. Another node refuses
+        with ``CADB070E``.
+        """
+        fallback = "take coordinated backup failed"
+        return _admin.parse_backup(self._post(_admin.BACKUP_COORDINATED, None, fallback), fallback)
+
+    def list(self) -> builtins.list[BackupInfo]:
+        """Every backup in the catalog. An entry whose manifest is bad has ``is_invalid`` set."""
+        fallback = "list backups failed"
+        return _admin.parse_backup_list(self._get(_admin.BACKUPS, fallback), fallback)
+
+    def chain(self, leaf_backup_id: str | uuid.UUID) -> builtins.list[BackupInfo]:
+        """The restore chain that ends at ``leaf_backup_id``, root first. The server checks it.
+
+        A chain that cannot restore is refused with ``CADB0701`` or ``CADB0706``. The first entry
+        has the restorable window of the whole chain.
+        """
+        fallback = "get backup chain failed"
+        leaf = _admin.backup_id(leaf_backup_id, "leaf_backup_id")
+        return _admin.parse_backup_list(
+            self._get(_admin.backup_chain_path(leaf), fallback), fallback
+        )
+
+    def preview_garbage_collection(self) -> BackupGcResult:
+        """What a retention pass would delete now. Nothing is deleted."""
+        path = _admin.backup_gc_path(dry_run=True)
+        return _admin.parse_backup_gc(self._post(path, None, "backup garbage collection failed"))
+
+    def collect_garbage(self) -> BackupGcResult:
+        """Run retention now, and delete what :meth:`preview_garbage_collection` reports.
+
+        The server runs retention after each backup and on a timer. Use this to free space at once
+        after you make the retention limits smaller.
+        """
+        path = _admin.backup_gc_path(dry_run=False)
+        return _admin.parse_backup_gc(self._post(path, None, "backup garbage collection failed"))
+
+    def _post(self, path: str, body: Any, fallback: str) -> dict[str, Any]:
+        conn = self._connection
+        conn._state.check_open()
+        return conn._transport.post(
+            path,
+            body,
+            endpoint=self._endpoint(),
+            fallback=fallback,
+            timeout=conn._state.config.backup_timeout,
+        )
+
+    def _get(self, path: str, fallback: str) -> dict[str, Any]:
+        conn = self._connection
+        conn._state.check_open()
+        return conn._transport.get(
+            path,
+            endpoint=self._endpoint(),
+            fallback=fallback,
+            timeout=conn._state.config.backup_timeout,
+        )
+
+    def _endpoint(self) -> str:
+        conn = self._connection
+        return conn._state.config.backup_endpoint or conn._transport.next_endpoint()
 
 
 def run_transaction(

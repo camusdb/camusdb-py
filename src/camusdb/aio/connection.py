@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from types import TracebackType
 from typing import Any, TypeVar
 
+from .. import _admin, codes
 from .. import _protocol as proto
-from .. import codes
+from .._admin import BackupGcResult, BackupInfo, NodeStats
 from .._base import (
     MAX_FINALIZE_ATTEMPTS,
     ConnectionState,
@@ -28,7 +31,7 @@ from ..rows import RowFactory
 from ..types import IsolationLevel, Locking
 from ._transport import AsyncTransport
 
-__all__ = ["AsyncConnection", "AsyncCursor", "connect", "run_transaction"]
+__all__ = ["AsyncBackups", "AsyncConnection", "AsyncCursor", "connect", "run_transaction"]
 
 T = TypeVar("T")
 
@@ -49,6 +52,8 @@ async def connect(
     http2: bool | None = None,
     token_lifetime: float | None = None,
     allow_insecure_credentials: bool | None = None,
+    backup_endpoint: str | None = None,
+    backup_timeout: float | None = None,
     row_factory: RowFactory | None = None,
 ) -> AsyncConnection:
     """Open an asyncio connection to CamusDB. The arguments are those of :func:`camusdb.connect`."""
@@ -68,6 +73,8 @@ async def connect(
             "http2": http2,
             "token_lifetime": token_lifetime,
             "allow_insecure_credentials": allow_insecure_credentials,
+            "backup_endpoint": backup_endpoint,
+            "backup_timeout": backup_timeout,
         },
     )
     return AsyncConnection(config, row_factory=row_factory)
@@ -84,6 +91,7 @@ class AsyncConnection:
     def __init__(self, config: Config, *, row_factory: RowFactory | None = None) -> None:
         self._state = ConnectionState(config, row_factory)
         self._transport = AsyncTransport(config)
+        self._backups: AsyncBackups | None = None
 
     def cursor(self, *, row_factory: RowFactory | None = None) -> AsyncCursor:
         self._state.check_open()
@@ -328,6 +336,20 @@ class AsyncConnection:
         )
         return proto.branches_from(proto.parse_query(body))
 
+    async def node_stats(self, endpoint: str | None = None) -> NodeStats:
+        self._state.check_open()
+        target = _admin.node_endpoint(self.endpoints, endpoint) or self._transport.next_endpoint()
+        body = await self._transport.get(
+            _admin.NODE_STATS, endpoint=target, fallback="node stats failed"
+        )
+        return _admin.parse_node_stats(body, target)
+
+    @property
+    def backups(self) -> AsyncBackups:
+        if self._backups is None:
+            self._backups = AsyncBackups(self)
+        return self._backups
+
     async def _admin(self, route: str, sql: str) -> dict[str, Any]:
         self._state.check_open()
         return await self._transport.post(
@@ -566,6 +588,78 @@ class AsyncCursor:
 
     async def setoutputsize(self, size: Any, column: int | None = None) -> None:
         """Does nothing: results are not truncated."""
+
+
+class AsyncBackups:
+    """The backup administration API, with coroutines. See :class:`camusdb.connection.Backups`."""
+
+    def __init__(self, connection: AsyncConnection) -> None:
+        self._connection = connection
+
+    async def take_full(self) -> BackupInfo:
+        fallback = "take full backup failed"
+        return _admin.parse_backup(await self._post(_admin.BACKUP_FULL, None, fallback), fallback)
+
+    async def take_incremental(self, parent_backup_id: str | uuid.UUID) -> BackupInfo:
+        fallback = "take incremental backup failed"
+        body = {"parentBackupId": _admin.backup_id(parent_backup_id, "parent_backup_id")}
+        return _admin.parse_backup(
+            await self._post(_admin.BACKUP_INCREMENTAL, body, fallback), fallback
+        )
+
+    async def take_coordinated(self) -> BackupInfo:
+        fallback = "take coordinated backup failed"
+        return _admin.parse_backup(
+            await self._post(_admin.BACKUP_COORDINATED, None, fallback), fallback
+        )
+
+    async def list(self) -> builtins.list[BackupInfo]:
+        fallback = "list backups failed"
+        return _admin.parse_backup_list(await self._get(_admin.BACKUPS, fallback), fallback)
+
+    async def chain(self, leaf_backup_id: str | uuid.UUID) -> builtins.list[BackupInfo]:
+        fallback = "get backup chain failed"
+        leaf = _admin.backup_id(leaf_backup_id, "leaf_backup_id")
+        return _admin.parse_backup_list(
+            await self._get(_admin.backup_chain_path(leaf), fallback), fallback
+        )
+
+    async def preview_garbage_collection(self) -> BackupGcResult:
+        path = _admin.backup_gc_path(dry_run=True)
+        return _admin.parse_backup_gc(
+            await self._post(path, None, "backup garbage collection failed")
+        )
+
+    async def collect_garbage(self) -> BackupGcResult:
+        path = _admin.backup_gc_path(dry_run=False)
+        return _admin.parse_backup_gc(
+            await self._post(path, None, "backup garbage collection failed")
+        )
+
+    async def _post(self, path: str, body: Any, fallback: str) -> dict[str, Any]:
+        conn = self._connection
+        conn._state.check_open()
+        return await conn._transport.post(
+            path,
+            body,
+            endpoint=self._endpoint(),
+            fallback=fallback,
+            timeout=conn._state.config.backup_timeout,
+        )
+
+    async def _get(self, path: str, fallback: str) -> dict[str, Any]:
+        conn = self._connection
+        conn._state.check_open()
+        return await conn._transport.get(
+            path,
+            endpoint=self._endpoint(),
+            fallback=fallback,
+            timeout=conn._state.config.backup_timeout,
+        )
+
+    def _endpoint(self) -> str:
+        conn = self._connection
+        return conn._state.config.backup_endpoint or conn._transport.next_endpoint()
 
 
 async def run_transaction(

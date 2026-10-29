@@ -47,10 +47,15 @@ class AsyncTransport:
         )
 
     async def get(
-        self, path: str, *, endpoint: str | None = None, fallback: str = "request failed"
+        self,
+        path: str,
+        *,
+        endpoint: str | None = None,
+        fallback: str = "request failed",
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         return await self._call(
-            "GET", path, None, endpoint=endpoint, fallback=fallback, timeout=None
+            "GET", path, None, endpoint=endpoint, fallback=fallback, timeout=timeout
         )
 
     async def _call(

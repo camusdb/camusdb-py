@@ -74,9 +74,14 @@ class Transport:
         return self._call("POST", path, body, endpoint=endpoint, fallback=fallback, timeout=timeout)
 
     def get(
-        self, path: str, *, endpoint: str | None = None, fallback: str = "request failed"
+        self,
+        path: str,
+        *,
+        endpoint: str | None = None,
+        fallback: str = "request failed",
+        timeout: float | None = None,
     ) -> dict[str, Any]:
-        return self._call("GET", path, None, endpoint=endpoint, fallback=fallback, timeout=None)
+        return self._call("GET", path, None, endpoint=endpoint, fallback=fallback, timeout=timeout)
 
     def _call(
         self,
