@@ -76,7 +76,7 @@ class Locking(str, enum.Enum):
 class Typed:
     """A parameter value with an explicit CamusDB type.
 
-    Most values need no wrapper: the driver takes the type from the Python type (see the README).
+    Most values need no wrapper: the driver takes the type from the Python type (see docs/queries.md).
     Use ``Typed`` for a type that Python cannot express, or to make an empty array typed::
 
         cur.execute("INSERT INTO m (v) VALUES (@v)", {"v": Typed(0.5, ColumnType.FLOAT32)})
