@@ -302,3 +302,60 @@ def test_backups(conn):
 
     preview = conn.backups.preview_garbage_collection()
     assert preview.applied is False
+
+
+def test_upsert(endpoint, database):
+    name = "u_" + uuid.uuid4().hex[:10]
+    with camusdb.connect(endpoint=endpoint, database=database, autocommit=True) as conn:
+        conn.execute(f"CREATE TABLE {name} (k STRING(16) PRIMARY KEY NOT NULL, n INT64 NOT NULL)")
+        assert conn.execute(f"UPSERT INTO {name} (k, n) VALUES ('a', 1)").rowcount == 1
+        cur = conn.execute(f"UPSERT INTO {name} (k, n) VALUES ('a', 7) RETURNING n")
+        assert cur.fetchall() == [(7,)]
+        assert list(conn.cursor().stream(f"UPSERT INTO {name} (k, n) VALUES ('b', 2)")) == []
+        assert conn.execute(f"SELECT k, n FROM {name} ORDER BY k").fetchall() == [
+            ("a", 7),
+            ("b", 2),
+        ]
+
+
+def test_jsonb(endpoint, database):
+    name = "j_" + uuid.uuid4().hex[:10]
+    with camusdb.connect(endpoint=endpoint, database=database, autocommit=True) as conn:
+        conn.execute(f"CREATE TABLE {name} (id INT64 PRIMARY KEY NOT NULL, doc JSONB)")
+        conn.execute(f"CREATE INDEX {name}_gin ON {name} USING GIN (doc)")
+        documents = [
+            {"kind": "login", "user": {"id": 7}, "price": decimal.Decimal("2.50")},
+            Typed("null", ColumnType.JSONB),
+            Typed('"abc"', ColumnType.JSONB),
+            None,
+        ]
+        for i, doc in enumerate(documents):
+            conn.execute(f"INSERT INTO {name} (id, doc) VALUES (@id, @doc)", {"id": i, "doc": doc})
+
+        cur = conn.execute(f"SELECT doc FROM {name} ORDER BY id")
+        assert cur.description[0][1] == ColumnType.JSONB
+        assert cur.fetchall() == [
+            ('{"kind": "login", "user": {"id": 7}, "price": 2.50}',),
+            ("null",),
+            ('"abc"',),
+            (None,),
+        ]
+        streamed = list(conn.cursor().stream(f"SELECT doc FROM {name} ORDER BY id"))
+        assert [row[0] for row in streamed] == [
+            '{"kind": "login", "user": {"id": 7}, "price": 2.50}',
+            "null",
+            '"abc"',
+            None,
+        ]
+
+        cur = conn.execute(
+            f"SELECT id, doc -> 'user' ->> 'id' FROM {name} WHERE doc @> @filter",
+            {"filter": {"kind": "login"}},
+        )
+        assert cur.fetchall() == [(0, "7")]
+
+        cur = conn.execute(
+            f"UPDATE {name} SET doc = @doc WHERE id = 1 RETURNING doc",
+            {"doc": Typed("null", ColumnType.JSONB)},
+        )
+        assert cur.fetchall() == [("null",)]

@@ -27,6 +27,7 @@ The driver never puts a value into the SQL text. The server receives each value 
 | `datetime.datetime` | `DATETIME`, in UTC. A datetime with no time zone is taken as UTC. |
 | `uuid.UUID` | `UUID` |
 | `list`, `tuple` | `ARRAY` |
+| `dict` | `JSONB`. See [JSONB](#jsonb). |
 
 Results come back with the same Python types. An `OID` comes back as a `str`, and a `FLOAT32` comes
 back as a `float`.
@@ -48,6 +49,47 @@ conn.execute(
 
 To make a new object id in Python, use `camusdb.ObjectId.generate()`.
 
+## JSONB
+
+A `JSONB` column (alias `JSON`) holds one JSON document. The SQL follows PostgreSQL `jsonb`: the
+operators `->`, `->>`, `@>`, `?` and the others, the `jsonb_*` functions, and GIN indexes.
+
+- A `dict` parameter binds as `JSONB`. A `list` binds as an `ARRAY`. To bind a list as one JSON
+  array document, use `Typed(value, ColumnType.JSONB)`.
+- A `str` typed `ColumnType.JSONB` goes to the server as it is, and the server parses it. A plain
+  `str` binds as a `STRING`.
+- The server has no `ARRAY(JSONB)`, so a list of `dict` values is refused.
+- Text that is not valid JSON fails with `CADB0418`. A document nested deeper than 512 levels fails
+  with `CADB0419`.
+
+A `JSONB` cell comes back as a `str` in the PostgreSQL text form: one space after each `:` and each
+`,`, and the keys in the stored order. Numbers keep all their digits. Use `json.loads()` to get a
+`dict`, with `parse_float=decimal.Decimal` if the numbers must stay exact.
+
+The driver does not give a `dict`, because JSON `null` and SQL `NULL` are different values. A JSON
+`null` document comes back as the text `"null"`, and SQL `NULL` comes back as `None`. A server older
+than this feature sends both as `None`.
+
+`camusdb.format_jsonb(text)` gives the PostgreSQL text form of any JSON text.
+
+```python
+from camusdb import ColumnType, Typed
+
+conn.execute("CREATE TABLE events (id OID PRIMARY KEY NOT NULL, payload JSONB NOT NULL)")
+conn.execute("CREATE INDEX events_payload_gin ON events USING GIN (payload)")
+
+conn.execute(
+    "INSERT INTO events (id, payload) VALUES (GEN_ID(), @payload)",
+    {"payload": {"kind": "login", "user": {"id": 7}}},
+)
+
+cur = conn.execute(
+    "SELECT payload, payload -> 'user' ->> 'id' FROM events WHERE payload @> @filter",
+    {"filter": Typed('{"kind": "login"}', ColumnType.JSONB)},
+)
+payload, user_id = cur.fetchone()  # '{"kind": "login", "user": {"id": 7}}', '7'
+```
+
 ## Results
 
 `execute()` reads all the rows into memory, and it returns the cursor:
@@ -62,6 +104,9 @@ cur.fetchall()
 - `cur.rowcount` is the number of rows that a query returned or that a write changed.
 
 To get a generated key, add `RETURNING` to the write. `cur.lastrowid` is always `None`.
+
+`UPSERT INTO` and `INSERT ... ON CONFLICT` are writes like `INSERT`. They take a `RETURNING` list
+too.
 
 ```python
 (new_id,) = conn.execute(

@@ -185,7 +185,14 @@ class Plan:
     def body(self, state: ConnectionState, txn: proto.TransactionHandle | None) -> dict[str, Any]:
         # Reads run in a snapshot with no locking mode, so only writes carry the autocommit options.
         autocommit = state.options() if self.kind is not _sql.StatementKind.QUERY else None
-        return proto.sql_body(state.database, self.sql, self.parameters, txn, autocommit)
+        return proto.sql_body(
+            state.database,
+            self.sql,
+            self.parameters,
+            txn,
+            autocommit,
+            jsonb_as_text=self.kind is not _sql.StatementKind.DDL,
+        )
 
     def result(self, body: Mapping[str, Any]) -> proto.Result:
         if self.kind is _sql.StatementKind.QUERY:
@@ -211,7 +218,9 @@ class StreamPlan(Plan):
 
     def body(self, state: ConnectionState, txn: proto.TransactionHandle | None) -> dict[str, Any]:
         autocommit = state.options() if self.write else None
-        return proto.sql_body(state.database, self.sql, self.parameters, txn, autocommit)
+        return proto.sql_body(
+            state.database, self.sql, self.parameters, txn, autocommit, jsonb_as_text=True
+        )
 
 
 class CursorState:

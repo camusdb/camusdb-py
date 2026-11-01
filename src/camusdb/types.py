@@ -52,6 +52,8 @@ class ColumnType(enum.IntEnum):
     ARRAY = 10
     UUID = 11
     NUMERIC = 12
+    JSONB = 13
+    """A JSON document (SQL ``JSONB``, alias ``JSON``). A result cell is its text: see docs/queries.md."""
 
 
 class IsolationLevel(str, enum.Enum):
@@ -177,7 +179,7 @@ class _DBAPIType(frozenset[int]):
         return frozenset.__hash__(self)
 
 
-STRING = _DBAPIType({ColumnType.STRING, ColumnType.ID})
+STRING = _DBAPIType({ColumnType.STRING, ColumnType.ID, ColumnType.JSONB})
 BINARY = _DBAPIType({ColumnType.BYTES})
 NUMBER = _DBAPIType({ColumnType.INT64, ColumnType.FLOAT64, ColumnType.FLOAT32, ColumnType.NUMERIC})
 DATETIME = _DBAPIType({ColumnType.DATE, ColumnType.DATETIME})

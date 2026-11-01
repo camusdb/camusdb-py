@@ -25,7 +25,9 @@ _QUERY_VERBS = frozenset(
     {"SELECT", "WITH", "SHOW", "EXPLAIN", "DESCRIBE", "DESC", "ANALYZE", "VALUES"}
 )
 
-_DML_VERBS = frozenset({"INSERT", "UPDATE", "DELETE", "CALL"})
+# UPSERT INTO is INSERT ... ON CONFLICT (primary key) DO UPDATE, so it is a write like INSERT. Sent as a
+# query, it would run without the autocommit options of the connection.
+_DML_VERBS = frozenset({"INSERT", "UPSERT", "UPDATE", "DELETE", "CALL"})
 
 # The statements the DDL endpoint runs, as keyword sequences. Kept in step with the .NET driver.
 _DDL_PREFIXES: tuple[tuple[str, ...], ...] = (

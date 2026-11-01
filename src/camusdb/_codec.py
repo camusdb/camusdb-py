@@ -16,7 +16,7 @@ import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-from . import codes
+from . import _jsonb, codes
 from .errors import DataError, InterfaceError, ProgrammingError
 from .types import ColumnType, ObjectId, Typed
 
@@ -30,8 +30,9 @@ _UINT64_MASK = 2**64 - 1
 _TICKS_EPOCH = dt.datetime(1, 1, 1, tzinfo=dt.timezone.utc)
 _TICKS_PER_SECOND = 10_000_000
 
-# An element type that the decoder can apply to the elements of an array column.
-_ELEMENT_TYPES = frozenset(ColumnType) - {ColumnType.NULL, ColumnType.ARRAY}
+# An element type that the decoder can apply to the elements of an array column. The server has no
+# ARRAY(JSONB).
+_ELEMENT_TYPES = frozenset(ColumnType) - {ColumnType.NULL, ColumnType.ARRAY, ColumnType.JSONB}
 
 
 # --- Encoding -------------------------------------------------------------------------------------
@@ -103,6 +104,9 @@ def infer_type(name: str, value: Any) -> ColumnType:
         return ColumnType.ID
     if isinstance(value, (list, tuple)):
         return ColumnType.ARRAY
+    # A list stays an ARRAY. To bind a list as one JSON array document, use Typed(..., JSONB).
+    if isinstance(value, Mapping):
+        return ColumnType.JSONB
     raise ProgrammingError(
         f"cannot infer the CamusDB type of parameter {name!r} from {type(value).__name__}; "
         "wrap the value in camusdb.Typed(value, ColumnType.X)",
@@ -121,10 +125,17 @@ def _encode_as(
             case ColumnType.ID:
                 return {"type": ColumnType.ID, "strValue": str(ObjectId(value))}
             case ColumnType.STRING:
-                return {
-                    "type": ColumnType.STRING,
-                    "strValue": value if isinstance(value, str) else str(value),
-                }
+                if isinstance(value, str):
+                    text = value
+                elif isinstance(value, (Mapping, list, tuple)):
+                    # A document bound as a STRING is its JSON text, and not the Python repr.
+                    text = _jsonb.to_text(value)
+                else:
+                    text = str(value)
+                return {"type": ColumnType.STRING, "strValue": text}
+            case ColumnType.JSONB:
+                # A document travels as JSON text. A str passes as it is, and the server parses it.
+                return {"type": ColumnType.JSONB, "strValue": _jsonb.from_parameter(value)}
             case ColumnType.INT64:
                 return {"type": ColumnType.INT64, "longValue": _to_int64(name, value)}
             case ColumnType.FLOAT64 | ColumnType.FLOAT32:
@@ -154,7 +165,7 @@ def _encode_as(
                 }
             case ColumnType.ARRAY:
                 return _encode_array(name, value, element_type)
-    except (TypeError, ValueError, OverflowError) as exc:
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
         raise DataError(
             f"cannot bind parameter {name!r} as {column_type.name}: {exc}", codes.INVALID_INPUT
         ) from None
@@ -181,6 +192,13 @@ def _encode_array(name: str, value: Any, element_type: ColumnType | None) -> Wir
             )
     if element_type == ColumnType.ARRAY:
         raise TypeError("an array of arrays is not supported")
+    if element_type == ColumnType.JSONB:
+        # An array of documents is itself a document.
+        raise ProgrammingError(
+            f"CamusDB has no ARRAY(JSONB), so array parameter {name!r} cannot hold documents; bind "
+            "one JSON array document instead: camusdb.Typed(value, ColumnType.JSONB)",
+            codes.INVALID_INPUT,
+        )
 
     elements = [
         {"type": ColumnType.NULL} if item is None else _encode_as(name, item, element_type, None)
@@ -282,12 +300,21 @@ def ticks_to_date(ticks: int) -> dt.date:
 class Column:
     """One column of a result schema."""
 
-    __slots__ = ("element_type", "name", "type")
+    __slots__ = ("element_type", "jsonb_as_text", "name", "type")
 
-    def __init__(self, name: str, type_: ColumnType, element_type: ColumnType | None) -> None:
+    def __init__(
+        self,
+        name: str,
+        type_: ColumnType,
+        element_type: ColumnType | None,
+        jsonb_as_text: bool = False,
+    ) -> None:
         self.name = name
         self.type = type_
         self.element_type = element_type
+        # True on a JSONB column whose cells are JSON strings that hold the document text. Only the
+        # server sets the mark. See decode_cell.
+        self.jsonb_as_text = jsonb_as_text
 
 
 def read_schema(columns: Any) -> list[Column]:
@@ -298,11 +325,13 @@ def read_schema(columns: Any) -> list[Column]:
     for column in columns:
         if not isinstance(column, Mapping):
             continue
+        column_type = _column_type(column.get("type"))
         schema.append(
             Column(
                 str(column.get("name") or ""),
-                _column_type(column.get("type")),
+                column_type,
                 _element_type(column.get("elementType")),
+                column_type == ColumnType.JSONB and column.get("jsonbAsText") is True,
             )
         )
     return schema
@@ -331,17 +360,34 @@ def decode_row(schema: Sequence[Column], row: Any) -> tuple[Any, ...]:
     if not isinstance(row, list):
         raise InterfaceError("malformed result row: expected a JSON array")
     values = [
-        decode_cell(row[i], column.type, column.element_type) if i < len(row) else None
+        decode_cell(row[i], column.type, column.element_type, column.jsonb_as_text)
+        if i < len(row)
+        else None
         for i, column in enumerate(schema)
     ]
     return tuple(values)
 
 
-def decode_cell(cell: Any, declared: ColumnType, element_type: ColumnType | None = None) -> Any:
+def decode_cell(
+    cell: Any,
+    declared: ColumnType,
+    element_type: ColumnType | None = None,
+    jsonb_as_text: bool = False,
+) -> Any:
     """Decode one cell against the declared type of its column."""
     if cell is None:
         return None
     match declared:
+        case ColumnType.JSONB:
+            # A JSONB cell has two forms. In a column that the server marked jsonbAsText, the cell is
+            # a JSON string that holds the text form, and a JSON null document is the string "null".
+            # Otherwise the cell is the document as native JSON, and the driver writes its text form.
+            # In that form the token null is SQL NULL above, so a JSON null document reads as None.
+            # Only a server older than jsonbAsText sends that form. The driver never guesses the
+            # form from the token, because a string document such as "abc" is valid in both forms.
+            if jsonb_as_text and isinstance(cell, str):
+                return cell
+            return _jsonb.to_text(cell)
         case ColumnType.ID:
             return str(cell)
         case ColumnType.BYTES:

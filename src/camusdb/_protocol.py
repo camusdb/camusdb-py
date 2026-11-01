@@ -102,15 +102,24 @@ def sql_body(
     parameters: Mapping[str, WireValue] | None,
     txn: TransactionHandle | None,
     autocommit: TransactionOptions | None,
+    *,
+    jsonb_as_text: bool = False,
 ) -> dict[str, Any]:
     """The body of the query, non-query and DDL routes.
 
     In a transaction the body names it. Outside one, ``autocommit`` sets the options of the short
     transaction the server begins for the statement.
+
+    ``jsonb_as_text`` asks the server to send each JSONB cell as a JSON string that holds the
+    document text. In the default form, a JSON null document and SQL NULL are the same token. A
+    server older than the field ignores it and marks no column, so the decoder still reads the cells
+    correctly.
     """
     body: dict[str, Any] = {"databaseName": database, "sql": sql}
     if parameters:
         body["parameters"] = parameters
+    if jsonb_as_text:
+        body["jsonbAsText"] = True
     if txn is not None:
         body["txnIdPT"] = txn.pt
         body["txnIdCounter"] = txn.counter

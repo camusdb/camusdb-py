@@ -14,7 +14,12 @@ The driver logs in one time and gets a token. Each statement then sends the toke
 
 - All the connections of the process with the same user and password share one token. This matters,
   because the server permits only 20 logins for each user each minute.
-- The driver gets a new token before the old one expires.
+- The driver gets a new token before the old one expires. At 80% of the token lifetime, the driver
+  continues to send the old token, and it logs in again in the background. A statement waits for a
+  login only when there is no token, or when the token reached 95% of its lifetime.
+- If a background login fails, the driver tries again 5 seconds later at the earliest.
+- If the server refuses a login because it is busy (`CADB0518`), the driver sends the login again, up
+  to three times, after a short random wait.
 - If the server rejects the token, the driver logs in again and sends the statement one more time.
 
 ## A token from elsewhere
@@ -55,5 +60,5 @@ If TLS ends at a proxy that you trust, set `allow_insecure_credentials=True`.
 | --- | --- |
 | `CADB0516` | The login failed, or the token is not valid. |
 | `CADB0517` | The user does not have the privilege. |
-| `CADB0518` | Too many logins for that user. Wait one minute. |
+| `CADB0518` | The server is busy, or there are too many logins for that user. The driver tries the login again three times. Then wait one minute. |
 | `CADB0519` | Credentials over plain HTTP. See [TLS](#tls). |

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -11,7 +13,7 @@ import httpx
 
 from . import _protocol as proto
 from . import codes
-from ._auth import AuthState
+from ._auth import AuthState, Token, busy_login_retry_delay
 from ._config import Config
 from ._endpoints import EndpointPool
 from .errors import Error, InterfaceError, OperationalError
@@ -169,29 +171,70 @@ class Transport:
         if not auth.can_login:
             return None
         cached = auth.cached()
-        if cached is not None and cached.fresh:
+        if cached is not None and cached.usable:
+            if not cached.fresh:
+                self._start_renewal(cached)
             return cached.value
         with auth.login_lock():
             # Another thread may have logged in while this one waited.
             cached = auth.cached()
-            if cached is not None and cached.fresh:
+            if cached is not None and cached.usable:
                 return cached.value
-            try:
-                return self.login(auth.user or "", auth.password, endpoint=endpoint)
-            except Error:
-                # A renewal that fails does not stop a token that is still good from being used.
-                if cached is not None and cached.usable:
-                    return cached.value
-                raise
+            return self.login(auth.user or "", auth.password, endpoint=endpoint)
+
+    def _start_renewal(self, stale: Token) -> None:
+        """Start one login in a background thread to replace ``stale``, which is still sent."""
+        key = self.auth.begin_renewal()
+        if key is None:
+            return
+        thread = threading.Thread(
+            target=self._renew, args=(key, stale), name="camusdb-token-renewal", daemon=True
+        )
+        try:
+            thread.start()
+        except BaseException:
+            self.auth.end_renewal(key, failed=True)
+            raise
+
+    def _renew(self, key: tuple[object, ...], stale: Token) -> None:
+        failed = False
+        try:
+            auth = self.auth
+            with auth.login_lock():
+                # A login, a logout or a rejected token while this thread waited already decided
+                # what the next token is.
+                current = auth.cached()
+                if current is None or current.value != stale.value or not auth.can_login:
+                    return
+                self.login(auth.user or "", auth.password)
+        except Exception:
+            # The old token is still valid, so nothing failed yet: statements continue to send it.
+            # If it expires first, the next statement logs in itself and gets the error.
+            failed = True
+        finally:
+            self.auth.end_renewal(key, failed)
 
     def login(self, user: str, password: str, *, endpoint: str | None = None) -> str:
         target = endpoint or self.pool.next()
-        response = self._send(
-            "POST", target, proto.LOGIN, {"user": user, "password": password}, None, None
-        )
-        body = proto.parse_response(response.status_code, response.content, "authentication failed")
+        attempt = 0
+        while True:
+            issued = time.monotonic()
+            response = self._send(
+                "POST", target, proto.LOGIN, {"user": user, "password": password}, None, None
+            )
+            try:
+                body = proto.parse_response(
+                    response.status_code, response.content, "authentication failed"
+                )
+                break
+            except Error as exc:
+                delay = busy_login_retry_delay(exc, attempt)
+                if delay is None:
+                    raise
+                attempt += 1
+                time.sleep(delay)
         value, expires_in = proto.parse_login(body)
-        self.auth.store(value, expires_in)
+        self.auth.store(value, expires_in, issued)
         return value
 
     def logout(self) -> None:

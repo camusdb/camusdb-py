@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -11,7 +12,7 @@ import httpx
 
 from .. import _protocol as proto
 from .. import codes
-from .._auth import AuthState
+from .._auth import AuthState, Token, busy_login_retry_delay
 from .._config import Config
 from .._endpoints import EndpointPool
 from .._transport import client_options, translate_transport_error
@@ -26,8 +27,15 @@ class AsyncTransport:
         # One login at a time for this connection. Other connections with the same credentials share
         # the token through the process-wide store.
         self._login_lock = asyncio.Lock()
+        # The background renewals in flight. The loop keeps only a weak reference to a task.
+        self._renewals: set[asyncio.Task[None]] = set()
 
     async def aclose(self) -> None:
+        renewals = list(self._renewals)
+        for task in renewals:
+            task.cancel()
+        if renewals:
+            await asyncio.gather(*renewals, return_exceptions=True)
         await self._client.aclose()
 
     def next_endpoint(self) -> str:
@@ -143,27 +151,64 @@ class AsyncTransport:
         if not auth.can_login:
             return None
         cached = auth.cached()
-        if cached is not None and cached.fresh:
+        if cached is not None and cached.usable:
+            if not cached.fresh:
+                self._start_renewal(cached)
             return cached.value
         async with self._login_lock:
             cached = auth.cached()
-            if cached is not None and cached.fresh:
+            if cached is not None and cached.usable:
                 return cached.value
-            try:
-                return await self.login(auth.user or "", auth.password, endpoint=endpoint)
-            except Error:
-                if cached is not None and cached.usable:
-                    return cached.value
-                raise
+            return await self.login(auth.user or "", auth.password, endpoint=endpoint)
+
+    def _start_renewal(self, stale: Token) -> None:
+        """Start one login in a background task to replace ``stale``, which is still sent."""
+        key = self.auth.begin_renewal()
+        if key is None:
+            return
+        try:
+            task = asyncio.get_running_loop().create_task(self._renew(key, stale))
+        except BaseException:
+            self.auth.end_renewal(key, failed=True)
+            raise
+        self._renewals.add(task)
+        task.add_done_callback(self._renewals.discard)
+
+    async def _renew(self, key: tuple[object, ...], stale: Token) -> None:
+        failed = False
+        try:
+            auth = self.auth
+            async with self._login_lock:
+                current = auth.cached()
+                if current is None or current.value != stale.value or not auth.can_login:
+                    return
+                await self.login(auth.user or "", auth.password)
+        except Exception:
+            failed = True
+        finally:
+            self.auth.end_renewal(key, failed)
 
     async def login(self, user: str, password: str, *, endpoint: str | None = None) -> str:
         target = endpoint or self.pool.next()
-        response = await self._send(
-            "POST", target, proto.LOGIN, {"user": user, "password": password}, None, None
-        )
-        body = proto.parse_response(response.status_code, response.content, "authentication failed")
+        attempt = 0
+        while True:
+            issued = time.monotonic()
+            response = await self._send(
+                "POST", target, proto.LOGIN, {"user": user, "password": password}, None, None
+            )
+            try:
+                body = proto.parse_response(
+                    response.status_code, response.content, "authentication failed"
+                )
+                break
+            except Error as exc:
+                delay = busy_login_retry_delay(exc, attempt)
+                if delay is None:
+                    raise
+                attempt += 1
+                await asyncio.sleep(delay)
         value, expires_in = proto.parse_login(body)
-        self.auth.store(value, expires_in)
+        self.auth.store(value, expires_in, issued)
         return value
 
     async def logout(self) -> None:

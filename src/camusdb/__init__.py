@@ -24,6 +24,7 @@ from ._admin import (
     NodeStatsError,
 )
 from ._config import redact as redact_connection_string
+from ._jsonb import format_jsonb
 from ._protocol import Branch
 from .connection import Backups, Connection, Cursor, connect, run_transaction
 from .errors import (
@@ -60,7 +61,7 @@ from .types import (
     Typed,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # PEP 249 module globals.
 apilevel = "2.0"
@@ -115,6 +116,7 @@ __all__ = [
     "apilevel",
     "codes",
     "connect",
+    "format_jsonb",
     "is_retryable",
     "paramstyle",
     "redact_connection_string",

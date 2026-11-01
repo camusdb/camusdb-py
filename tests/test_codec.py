@@ -1,5 +1,6 @@
 import datetime as dt
 import decimal
+import json
 import uuid
 
 import pytest
@@ -17,6 +18,7 @@ from camusdb._codec import (
     ticks_to_date,
     ticks_to_datetime,
 )
+from camusdb._jsonb import format_jsonb, to_text
 
 UTC = dt.timezone.utc
 
@@ -224,3 +226,75 @@ class TestDecode:
 
     def test_array_without_element_type_uses_tokens(self):
         assert decode_cell([1, "a", True], ColumnType.ARRAY) == [1, "a", True]
+
+
+class TestJsonb:
+    def test_a_dict_binds_as_a_document(self):
+        assert encode_value("@d", {"a": [1, 2.5, None], "b": "x"}) == {
+            "type": ColumnType.JSONB,
+            "strValue": '{"a": [1, 2.5, null], "b": "x"}',
+        }
+
+    def test_a_typed_string_passes_as_it_is(self):
+        text = '{"a":1}'
+        assert encode_value("@d", Typed(text, ColumnType.JSONB))["strValue"] == text
+
+    def test_a_typed_list_is_one_document(self):
+        wire = encode_value("@d", Typed([1, {"x": decimal.Decimal("2.50")}], ColumnType.JSONB))
+        assert wire == {"type": ColumnType.JSONB, "strValue": '[1, {"x": 2.50}]'}
+
+    def test_a_plain_string_stays_a_string(self):
+        assert encode_value("@s", '{"a": 1}')["type"] == ColumnType.STRING
+
+    def test_a_document_typed_string_is_its_json_text(self):
+        assert encode_value("@s", Typed({"a": 1}, ColumnType.STRING))["strValue"] == '{"a": 1}'
+
+    def test_an_array_of_documents_is_refused(self):
+        with pytest.raises(camusdb.ProgrammingError, match="ARRAY\\(JSONB\\)"):
+            encode_value("@a", [{"a": 1}])
+        with pytest.raises(camusdb.ProgrammingError):
+            encode_value("@a", Typed(["{}"], ColumnType.ARRAY, element_type=ColumnType.JSONB))
+
+    def test_a_value_json_cannot_hold_is_a_data_error(self):
+        with pytest.raises(camusdb.DataError):
+            encode_value("@d", {"a": float("nan")})
+        with pytest.raises(camusdb.DataError):
+            encode_value("@d", {1: "a"})
+
+    def test_a_marked_column_keeps_json_null_apart_from_sql_null(self):
+        schema = read_schema([{"name": "doc", "type": 13, "jsonbAsText": True}])
+        rows = [
+            ['{"a": [1, 12345678901234567890.50]}'],
+            ["null"],
+            ['"abc"'],
+            [None],
+        ]
+        assert [decode_row(schema, row) for row in rows] == [
+            ('{"a": [1, 12345678901234567890.50]}',),
+            ("null",),
+            ('"abc"',),
+            (None,),
+        ]
+
+    def test_an_unmarked_column_keeps_the_native_form(self):
+        # A server older than jsonbAsText: a string cell is a string document.
+        schema = read_schema([{"name": "doc", "type": 13}])
+        assert decode_row(schema, ['{"a": 1}']) == ('"{\\"a\\": 1}"',)
+        assert decode_row(schema, [{"b": [True, None], "a": 1}]) == ('{"b": [true, null], "a": 1}',)
+        assert decode_row(schema, [None]) == (None,)
+
+    def test_format_keeps_order_numbers_and_escapes(self):
+        text = '{ "b":1.50,"a" : [ 1e3, -0, 12345678901234567890.123 ], "c":"q\\"\\n\\u0001é" }'
+        assert format_jsonb(text) == (
+            '{"b": 1.50, "a": [1e3, -0, 12345678901234567890.123], "c": "q\\"\\n\\u0001é"}'
+        )
+        assert camusdb.format_jsonb("null") == "null"
+
+    @pytest.mark.parametrize("text", ["", "1 2", "NaN", "{"])
+    def test_format_refuses_text_that_is_not_one_document(self, text):
+        with pytest.raises(ValueError):
+            format_jsonb(text)
+
+    def test_a_deep_document(self):
+        text = "[" * 512 + "]" * 512
+        assert to_text(json.loads(text)) == text

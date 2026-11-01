@@ -1,6 +1,13 @@
 import pytest
 
-from camusdb._sql import StatementKind, classify, has_returning, keywords, runs_in_own_transaction
+from camusdb._sql import (
+    StatementKind,
+    classify,
+    has_returning,
+    is_dml,
+    keywords,
+    runs_in_own_transaction,
+)
 
 
 @pytest.mark.parametrize(
@@ -9,6 +16,7 @@ from camusdb._sql import StatementKind, classify, has_returning, keywords, runs_
         ("SELECT * FROM robots", StatementKind.QUERY),
         ("  select 1", StatementKind.QUERY),
         ("(SELECT 1)", StatementKind.QUERY),
+        ("(SELECT a FROM t ORDER BY a LIMIT 5) UNION ALL SELECT b FROM u", StatementKind.QUERY),
         ("-- leading comment\nSELECT 1", StatementKind.QUERY),
         ("/* block */ SHOW TABLES", StatementKind.QUERY),
         ("WITH x AS (SELECT 1) SELECT * FROM x", StatementKind.QUERY),
@@ -18,6 +26,12 @@ from camusdb._sql import StatementKind, classify, has_returning, keywords, runs_
         ("INSERT INTO robots (id) VALUES (GEN_ID())", StatementKind.NON_QUERY),
         ("UPDATE robots SET year = 1", StatementKind.NON_QUERY),
         ("DELETE FROM robots", StatementKind.NON_QUERY),
+        ("UPSERT INTO counters (k, n) VALUES ('a', 1)", StatementKind.NON_QUERY),
+        ("UPSERT INTO counters (k, n) VALUES ('a', 1) RETURNING n", StatementKind.NON_QUERY),
+        (
+            "INSERT INTO t (k, n) VALUES (1, 2) ON CONFLICT (k) DO UPDATE SET n = excluded.n",
+            StatementKind.NON_QUERY,
+        ),
         ("CALL transfer(@a)", StatementKind.NON_QUERY),
         ("CREATE USER app IDENTIFIED BY @password", StatementKind.NON_QUERY),
         ("CREATE DATABASE IF NOT EXISTS shop", StatementKind.NON_QUERY),
@@ -49,6 +63,18 @@ def test_a_backslash_escapes_the_next_character():
 def test_returning():
     assert has_returning("INSERT INTO t (a) VALUES (1) RETURNING id")
     assert not has_returning("INSERT INTO t (a) VALUES ('RETURNING')")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    ["INSERT INTO t (a) VALUES (1)", "  upsert into t (a) values (1)", "UPDATE t SET a = 1"],
+)
+def test_writes(sql):
+    assert is_dml(sql)
+
+
+def test_a_query_is_not_a_write():
+    assert not is_dml("SELECT upsert FROM t")
 
 
 def test_truncate_runs_in_its_own_transaction():

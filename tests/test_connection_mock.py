@@ -1,13 +1,16 @@
 """Connection behavior against a fake server: what the driver sends, and how it reacts."""
 
 import json
+import threading
+import time
 
 import httpx
 import pytest
 
 import camusdb
+import camusdb._auth
 from camusdb import codes
-from camusdb._auth import TOKENS
+from camusdb._auth import TOKENS, Token
 from camusdb._endpoints import EndpointPool
 
 
@@ -80,6 +83,7 @@ def test_the_first_statement_begins_a_transaction(server, connect):
         "parameters": {"@y": {"type": 2, "longValue": 5}},
         "txnIdPT": 1001,
         "txnIdCounter": 0,
+        "jsonbAsText": True,
     }
     conn.commit()
     assert server.paths()[-1] == "/commit-transaction"
@@ -269,6 +273,55 @@ def test_a_failure_after_rows_began_is_raised_from_the_iteration(server, connect
         next(rows)
 
 
+def test_ddl_does_not_ask_for_jsonb_text(server, connect):
+    conn = connect(autocommit=True)
+    conn.execute("CREATE TABLE t (id OID PRIMARY KEY NOT NULL)")
+    _, body, _ = server.requests[0]
+    assert "jsonbAsText" not in body
+
+
+def test_a_streamed_upsert_without_returning_runs_as_a_write(server, connect):
+    conn = connect(autocommit=True, isolation_level="ReadCommitted")
+    cur = conn.cursor()
+    assert list(cur.stream("UPSERT INTO counters (k, n) VALUES ('a', 1)")) == []
+    assert cur.rowcount == 3
+    assert server.paths() == ["/execute-sql-non-query"]
+    _, body, _ = server.requests[0]
+    assert body["isolationLevel"] == "ReadCommitted"
+
+
+def test_a_streamed_upsert_with_returning_carries_the_autocommit_options(server, connect):
+    lines = [
+        {"status": "ok", "columns": [{"name": "n", "type": 2}]},
+        [7],
+        {"status": "ok", "total": 1},
+    ]
+    server.handlers["/execute-sql-query-stream"] = lambda body, req: httpx.Response(
+        200, content="\n".join(json.dumps(line) for line in lines)
+    )
+    conn = connect(autocommit=True, isolation_level="ReadCommitted")
+    rows = list(conn.cursor().stream("UPSERT INTO counters (k, n) VALUES ('a', 7) RETURNING n"))
+    assert rows == [(7,)]
+    _, body, _ = server.requests[0]
+    assert body["isolationLevel"] == "ReadCommitted"
+    assert body["jsonbAsText"] is True
+
+
+def test_jsonb_round_trip(server, connect):
+    server.handlers["/execute-sql-query"] = lambda body, req: {
+        "status": "ok",
+        "columns": [{"name": "doc", "type": 13, "jsonbAsText": True}],
+        "rows": [['{"kind": "login"}'], ["null"], [None]],
+    }
+    conn = connect(autocommit=True)
+    cur = conn.execute("SELECT doc FROM events WHERE doc @> @filter", {"filter": {"kind": "login"}})
+    assert cur.fetchall() == [('{"kind": "login"}',), ("null",), (None,)]
+    assert cur.description[0][1] == camusdb.ColumnType.JSONB
+    assert cur.description[0][1] == camusdb.STRING
+    _, body, _ = server.requests[0]
+    assert body["parameters"]["@filter"] == {"type": 13, "strValue": '{"kind": "login"}'}
+
+
 def test_insert_route(server, connect):
     conn = connect(autocommit=True)
     server.handlers["/insert"] = lambda body, req: {"status": "ok", "rows": 1}
@@ -286,7 +339,139 @@ def test_insert_route(server, connect):
 
 class TestAuthentication:
     def setup_method(self):
-        TOKENS._tokens.clear()
+        TOKENS.clear()
+
+    @staticmethod
+    def _age_token(conn, value, fraction, lifetime=100.0):
+        """Cache ``value`` for the credentials of ``conn`` as a token at ``fraction`` of its life."""
+        auth = conn._transport.auth
+        TOKENS.put(auth._key, Token(value, time.monotonic() - fraction * lifetime, lifetime))
+
+    @staticmethod
+    def _wait_for_renewals():
+        for thread in threading.enumerate():
+            if thread.name == "camusdb-token-renewal":
+                thread.join(5)
+
+    def test_an_old_token_is_sent_while_a_background_login_replaces_it(self, server, connect):
+        server.handlers["/login"] = lambda body, req: {
+            "status": "ok",
+            "token": "new",
+            "expiresInSeconds": 900,
+        }
+        conn = connect(
+            endpoint="http://localhost:9103", user="app", password="secret", autocommit=True
+        )
+        self._age_token(conn, "old", 0.85)
+
+        conn.execute("SELECT 1")
+        self._wait_for_renewals()
+        conn.execute("SELECT 1")
+
+        sent = [(path, headers.get("authorization")) for path, _, headers in server.requests]
+        assert sent.count(("/login", None)) == 1
+        queries = [auth for path, auth in sent if path == "/execute-sql-query"]
+        assert queries == ["Bearer old", "Bearer new"]
+        assert conn.access_token == "new"
+
+    def test_a_failed_background_renewal_keeps_the_old_token(self, server, connect):
+        server.handlers["/login"] = lambda body, req: failure("CADB0516", status=401)
+        conn = connect(
+            endpoint="http://localhost:9104", user="app", password="secret", autocommit=True
+        )
+        self._age_token(conn, "old", 0.85)
+
+        conn.execute("SELECT 1")
+        self._wait_for_renewals()
+        conn.execute("SELECT 1")
+        self._wait_for_renewals()
+
+        # The second statement does not start a new login: the retry waits 5 seconds.
+        assert server.paths().count("/login") == 1
+        queries = [
+            headers["authorization"]
+            for path, _, headers in server.requests
+            if path == "/execute-sql-query"
+        ]
+        assert queries == ["Bearer old", "Bearer old"]
+
+    def test_an_expired_token_waits_for_the_login(self, server, connect):
+        server.handlers["/login"] = lambda body, req: {"status": "ok", "token": "new"}
+        conn = connect(
+            endpoint="http://localhost:9105", user="app", password="secret", autocommit=True
+        )
+        self._age_token(conn, "old", 0.96)
+        conn.execute("SELECT 1")
+        assert server.paths() == ["/login", "/execute-sql-query"]
+        assert server.requests[1][2]["authorization"] == "Bearer new"
+
+    def test_a_busy_login_is_sent_again(self, server, connect, monkeypatch):
+        monkeypatch.setattr(camusdb._auth, "BUSY_LOGIN_RETRY_DELAYS", (0, 0, 0))
+        replies = iter([failure("CADB0518", status=429), failure("CADB0518", status=429)])
+        server.handlers["/login"] = lambda body, req: next(
+            replies, {"status": "ok", "token": "tok"}
+        )
+        conn = connect(
+            endpoint="http://localhost:9106", user="app", password="secret", autocommit=True
+        )
+        conn.execute("SELECT 1")
+        assert server.paths() == ["/login", "/login", "/login", "/execute-sql-query"]
+
+    def test_a_login_busy_four_times_fails(self, server, connect, monkeypatch):
+        monkeypatch.setattr(camusdb._auth, "BUSY_LOGIN_RETRY_DELAYS", (0, 0, 0))
+        server.handlers["/login"] = lambda body, req: failure("CADB0518", status=429)
+        conn = connect(
+            endpoint="http://localhost:9107", user="app", password="secret", autocommit=True
+        )
+        with pytest.raises(camusdb.Error) as info:
+            conn.execute("SELECT 1")
+        assert info.value.code == codes.TOO_MANY_AUTH_ATTEMPTS
+        assert server.paths() == ["/login"] * 4
+
+    def test_another_refusal_is_not_sent_again(self, server, connect, monkeypatch):
+        monkeypatch.setattr(camusdb._auth, "BUSY_LOGIN_RETRY_DELAYS", (0, 0, 0))
+        server.handlers["/login"] = lambda body, req: failure("CADB0516", status=401)
+        conn = connect(
+            endpoint="http://localhost:9108", user="app", password="wrong", autocommit=True
+        )
+        with pytest.raises(camusdb.Error):
+            conn.execute("SELECT 1")
+        assert server.paths() == ["/login"]
+
+    @pytest.mark.anyio
+    async def test_async_background_renewal_and_busy_login(self, server, monkeypatch):
+        import camusdb.aio
+
+        monkeypatch.setattr(camusdb._auth, "BUSY_LOGIN_RETRY_DELAYS", (0, 0, 0))
+        replies = iter([failure("CADB0518", status=429)])
+        server.handlers["/login"] = lambda body, req: next(
+            replies, {"status": "ok", "token": "new", "expiresInSeconds": 900}
+        )
+        conn = await camusdb.aio.connect(
+            endpoint="http://localhost:9109",
+            database="test",
+            user="app",
+            password="secret",
+            autocommit=True,
+        )
+        conn._transport._client = httpx.AsyncClient(transport=httpx.MockTransport(server))
+        try:
+            self._age_token(conn, "old", 0.85)
+            await conn.execute("SELECT 1")
+            renewals = list(conn._transport._renewals)
+            assert len(renewals) == 1
+            await renewals[0]
+            await conn.execute("SELECT 1")
+        finally:
+            await conn.close()
+
+        queries = [
+            headers["authorization"]
+            for path, _, headers in server.requests
+            if path == "/execute-sql-query"
+        ]
+        assert queries == ["Bearer old", "Bearer new"]
+        assert server.paths().count("/login") == 2
 
     def test_one_login_is_shared_by_connections(self, server, connect):
         server.handlers["/login"] = lambda body, req: {
