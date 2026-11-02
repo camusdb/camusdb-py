@@ -70,6 +70,15 @@ class TestEncode:
     def test_bool_is_not_an_int(self):
         assert encode_value("@p", False)["type"] == ColumnType.BOOL
 
+    @pytest.mark.parametrize("text", ["1_000", " 12", "12 ", "\u0661\u0662", "", "+", "1.0"])
+    def test_int64_text_must_be_ascii_digits(self, text):
+        with pytest.raises(camusdb.DataError):
+            encode_value("n", Typed(text, ColumnType.INT64))
+
+    def test_int64_text_with_a_sign(self):
+        assert encode_value("n", Typed("-42", ColumnType.INT64))["longValue"] == -42
+        assert encode_value("n", Typed("+42", ColumnType.INT64))["longValue"] == 42
+
     def test_an_int_outside_int64_is_refused(self):
         with pytest.raises(camusdb.DataError, match="INT64"):
             encode_value("@p", 2**63)
@@ -298,3 +307,20 @@ class TestJsonb:
     def test_a_deep_document(self):
         text = "[" * 512 + "]" * 512
         assert to_text(json.loads(text)) == text
+
+    def test_a_document_deeper_than_the_server_limit_is_refused(self):
+        with pytest.raises(ValueError, match="512"):
+            to_text(json.loads("[" * 513 + "]" * 513))
+        # Far past the interpreter's recursion limit, still a ValueError.
+        deep: list = []
+        for _ in range(5000):
+            deep = [deep]
+        with pytest.raises(ValueError):
+            to_text(deep)
+
+    def test_a_parameter_deeper_than_the_server_limit_is_a_data_error(self):
+        deep: dict = {}
+        for _ in range(600):
+            deep = {"a": deep}
+        with pytest.raises(camusdb.DataError):
+            encode_parameters({"doc": deep})

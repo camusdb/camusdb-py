@@ -6,11 +6,12 @@ receive, so both speak exactly the same protocol.
 
 from __future__ import annotations
 
+import functools
 import json
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 
 from . import codes
 from ._codec import Column, WireValue, decode_row, read_schema
@@ -18,6 +19,42 @@ from .errors import Error, InterfaceError, ProgrammingError, error_for_code
 from .types import ColumnType, IsolationLevel, Locking
 
 NDJSON = "application/x-ndjson"
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+# What a decoder raises for a response that is valid JSON but not valid wire data: a cell of the wrong
+# JSON type (TypeError), text that does not convert (ValueError, decimal.InvalidOperation), a number
+# out of range (OverflowError), a missing field (KeyError) or a document nested too deep
+# (RecursionError).
+_MALFORMED = (TypeError, ValueError, ArithmeticError, LookupError, RecursionError)
+
+
+def malformed_response(what: str, exc: BaseException) -> InterfaceError:
+    return InterfaceError(
+        f"{what}: the server sent a malformed response ({type(exc).__name__}: {sanitize(exc)})"
+    )
+
+
+def decoder(what: str) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]:
+    """Make a response decoder raise :class:`InterfaceError` for a malformed response.
+
+    Every exception the driver raises is an :class:`Error`, and a response from a server of another
+    version, from a proxy or from a hostile endpoint must not break that rule.
+    """
+
+    def wrap(func: Callable[_P, _R]) -> Callable[_P, _R]:
+        @functools.wraps(func)
+        def checked(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            try:
+                return func(*args, **kwargs)
+            except _MALFORMED as exc:
+                raise malformed_response(what, exc) from exc
+
+        return checked
+
+    return wrap
+
 
 # Routes.
 START_TRANSACTION = "/start-transaction"
@@ -147,7 +184,7 @@ def parse_response(
     """Decode a JSON response, and raise the server's error if the response is a failure."""
     try:
         body = json.loads(content) if content else None
-    except ValueError:
+    except (ValueError, RecursionError):
         body = None
 
     if isinstance(body, dict):
@@ -166,11 +203,13 @@ def expect_ok(body: Mapping[str, Any], fallback: str) -> None:
         raise error_for_code(body.get("code"), sanitize(body.get("message")) or fallback)
 
 
+@decoder("start transaction")
 def parse_start_transaction(body: Mapping[str, Any], endpoint: str) -> TransactionHandle:
     expect_ok(body, "start transaction failed")
     return TransactionHandle(int(body["txnIdPT"]), int(body.get("txnIdCounter") or 0), endpoint)
 
 
+@decoder("query")
 def parse_query(body: Mapping[str, Any]) -> Result:
     schema = read_schema(body.get("columns"))
     rows_raw = body.get("rows")
@@ -182,9 +221,10 @@ def parse_query(body: Mapping[str, Any]) -> Result:
     return Result(schema, rows, len(rows))
 
 
+@decoder("statement")
 def parse_non_query(body: Mapping[str, Any]) -> Result:
     """A write's row count, and the rows of its RETURNING list when it has one."""
-    rowcount = int(body.get("rows") or 0)
+    rowcount = parse_rowcount(body)
     if isinstance(body.get("columns"), list):
         schema = read_schema(body["columns"])
         raw = body.get("returningRows")
@@ -193,6 +233,13 @@ def parse_non_query(body: Mapping[str, Any]) -> Result:
     return Result(None, [], rowcount)
 
 
+@decoder("statement")
+def parse_rowcount(body: Mapping[str, Any]) -> int:
+    """The ``rows`` count of a write. A missing count is 0."""
+    return int(body.get("rows") or 0)
+
+
+@decoder("login")
 def parse_login(body: Mapping[str, Any]) -> tuple[str, float | None]:
     """The token and its remaining lifetime in seconds, if the server reported one."""
     token = body.get("token")
@@ -236,6 +283,7 @@ def show_ancestors_sql(name: str) -> str:
     return f"SHOW ANCESTORS FROM {quote_identifier(name)}"
 
 
+@decoder("branches")
 def branches_from(result: Result) -> list[Branch]:
     """The rows of SHOW BRANCHES or SHOW ANCESTORS. An ancestor row has no parent column."""
     names = [column.name for column in result.schema or []]
@@ -266,6 +314,7 @@ class StreamDecoder:
         self.schema: list[Column] | None = None
         self.finished = False
 
+    @decoder("streaming query")
     def header(self, line: bytes) -> list[Column]:
         meta = json.loads(line)
         if not isinstance(meta, dict):
@@ -274,6 +323,7 @@ class StreamDecoder:
         self.schema = read_schema(meta.get("columns"))
         return self.schema
 
+    @decoder("streaming query")
     def row(self, line: bytes) -> tuple[Any, ...] | None:
         """The decoded row, or None for the trailer."""
         value = json.loads(line)
@@ -303,7 +353,15 @@ def description(schema: list[Column] | None) -> tuple[tuple[Any, ...], ...] | No
 # --- Error text -----------------------------------------------------------------------------------
 
 _MAX_ERROR_LENGTH = 2048
-_SECRET_PREFIXES = ("bearer ", "password=", 'password":', "pwd=", "accesstoken=", 'token":')
+_SECRET_PREFIXES = (
+    "bearer ",
+    "basic ",
+    "password=",
+    'password":',
+    "pwd=",
+    "accesstoken=",
+    'token":',
+)
 _VALUE_ENDS = frozenset(" \"',;})\n\r")
 
 

@@ -13,6 +13,7 @@ literals and quoted identifiers, so a keyword inside one of these does not count
 from __future__ import annotations
 
 import enum
+from typing import NamedTuple
 
 
 class StatementKind(enum.Enum):
@@ -55,11 +56,36 @@ _DDL_PREFIXES: tuple[tuple[str, ...], ...] = (
 
 def keywords(sql: str, limit: int | None = None) -> list[str]:
     """Return the bare words of ``sql``, upper-cased, in order, at most ``limit`` of them."""
-    words: list[str] = []
+    return [word.text for word in _words(sql, limit)]
+
+
+class _Word(NamedTuple):
+    text: str
+    # The number of parentheses open around the word.
+    depth: int
+    # True when the word is the first one after an opening parenthesis.
+    opens: bool
+
+
+def _words(sql: str, limit: int | None = None) -> list[_Word]:
+    words: list[_Word] = []
+    depth = 0
+    opens = False
     i, n = 0, len(sql)
     while i < n and (limit is None or len(words) < limit):
         c = sql[i]
-        if c.isspace() or c in "(),;":
+        if c == "(":
+            depth += 1
+            opens = True
+            i += 1
+        elif c == ")":
+            depth = max(depth - 1, 0)
+            opens = False
+            i += 1
+        elif c.isspace():
+            i += 1
+        elif c in ",;":
+            opens = False
             i += 1
         elif sql.startswith("--", i):
             end = sql.find("\n", i)
@@ -69,12 +95,15 @@ def keywords(sql: str, limit: int | None = None) -> list[str]:
             i = n if end < 0 else end + 2
         elif c in "'\"`":
             i = _skip_quoted(sql, i, c)
+            opens = False
         elif c.isalpha() or c == "_":
             start = i
             while i < n and (sql[i].isalnum() or sql[i] == "_"):
                 i += 1
-            words.append(sql[start:i].upper())
+            words.append(_Word(sql[start:i].upper(), depth, opens))
+            opens = False
         else:
+            opens = False
             i += 1
     return words
 
@@ -104,14 +133,49 @@ def classify(sql: str) -> StatementKind:
         return StatementKind.NON_QUERY
     if any(tuple(head[: len(prefix)]) == prefix for prefix in _DDL_PREFIXES):
         return StatementKind.DDL
+    if head[0] == "WITH" and _with_writes(_words(sql)):
+        return StatementKind.NON_QUERY
     if head[0] in _QUERY_VERBS or head[:2] == ["SET", "TRANSACTION"]:
         return StatementKind.QUERY
     return StatementKind.NON_QUERY
 
 
 def is_dml(sql: str) -> bool:
-    head = keywords(sql, limit=1)
-    return bool(head) and head[0] in _DML_VERBS
+    words = _words(sql)
+    if not words:
+        return False
+    if words[0].text == "WITH":
+        return _with_writes(words)
+    return words[0].text in _DML_VERBS
+
+
+# The words that can begin the main statement after the WITH clause.
+_MAIN_VERBS = _DML_VERBS | {"SELECT", "VALUES", "TABLE"}
+
+
+def _with_writes(words: list[_Word]) -> bool:
+    """Whether a statement that begins with ``WITH`` writes.
+
+    It writes when its main statement is a write (``WITH x AS (...) DELETE ...``), or when the body of
+    one of its common table expressions is a write (``WITH d AS (DELETE ... RETURNING *) SELECT ...``).
+    Such a statement must go to the non-query endpoint and carry the autocommit options, as an
+    ``INSERT`` does.
+    """
+    for k in range(1, len(words)):
+        word = words[k]
+        if word.depth == 0 and word.text in _MAIN_VERBS:
+            # The main statement. Every CTE body is before it.
+            return word.text in _DML_VERBS
+        previous = words[k - 1]
+        if (
+            word.depth == 1
+            and word.opens
+            and previous.depth == 0
+            and previous.text in {"AS", "MATERIALIZED"}
+            and word.text in _DML_VERBS
+        ):
+            return True
+    return False
 
 
 def has_returning(sql: str) -> bool:

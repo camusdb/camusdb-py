@@ -60,7 +60,8 @@ operators `->`, `->>`, `@>`, `?` and the others, the `jsonb_*` functions, and GI
   `str` binds as a `STRING`.
 - The server has no `ARRAY(JSONB)`, so a list of `dict` values is refused.
 - Text that is not valid JSON fails with `CADB0418`. A document nested deeper than 512 levels fails
-  with `CADB0419`.
+  with `CADB0419`. The driver refuses a `dict` or a `list` nested that deep with a `DataError`, before
+  it sends the statement.
 
 A `JSONB` cell comes back as a `str` in the PostgreSQL text form: one space after each `:` and each
 `,`, and the keys in the stored order. Numbers keep all their digits. Use `json.loads()` to get a

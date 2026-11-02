@@ -15,7 +15,7 @@ from .. import codes
 from .._auth import AuthState, Token, busy_login_retry_delay
 from .._config import Config
 from .._endpoints import EndpointPool
-from .._transport import client_options, translate_transport_error
+from .._transport import LineSplitter, client_options, translate_transport_error
 from ..errors import Error
 
 
@@ -228,12 +228,9 @@ def _bearer(token: str | None) -> dict[str, str]:
 
 
 async def _lines(chunks: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
-    pending = b""
+    splitter = LineSplitter()
     async for chunk in chunks:
-        pending += chunk
-        *complete, pending = pending.split(b"\n")
-        for line in complete:
-            if line := line.strip():
-                yield line
-    if pending := pending.strip():
-        yield pending
+        for line in splitter.feed(chunk):
+            yield line
+    for line in splitter.finish():
+        yield line

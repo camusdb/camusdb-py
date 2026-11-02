@@ -25,7 +25,7 @@ To log a connection string without its password, use `camusdb.redact_connection_
 
 | Keyword | Connection-string key | Default | What it does |
 | --- | --- | --- | --- |
-| `endpoint` | `Endpoint` | required | The URL of a node. A list, or a comma-separated string, names several nodes. |
+| `endpoint` | `Endpoint` | required | The URL of a node. A list, or a comma-separated string, names several nodes. The URL cannot hold a user name or a password: use `user` and `password`. |
 | `database` | `Database` | required | The database to use. |
 | `user`, `password` | `User`, `Password` | none | See [Authentication](authentication.md). |
 | `access_token` | `AccessToken` | none | A token that you got elsewhere. See [Authentication](authentication.md). |

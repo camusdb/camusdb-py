@@ -1,6 +1,7 @@
 import pytest
 
 import camusdb
+from camusdb import _protocol as proto
 from camusdb import codes
 from camusdb._protocol import parse_response, sanitize
 from camusdb.errors import error_for_code
@@ -77,3 +78,62 @@ def test_is_retryable():
             raise RuntimeError("wrapped") from inner
     except RuntimeError as outer:
         assert camusdb.is_retryable(outer)
+
+
+@pytest.mark.parametrize(
+    ("columns", "rows"),
+    [
+        ([{"name": "b", "type": 7}], [[5]]),  # BYTES that is not base64 text
+        ([{"name": "b", "type": 7}], [["not base64!"]]),
+        ([{"name": "n", "type": 12}], [["12.34abc"]]),  # NUMERIC
+        ([{"name": "d", "type": 9}], [[10**30]]),  # DATETIME out of range
+        ([{"name": "d", "type": 8}], [[-(10**20)]]),  # DATE out of range
+        ([{"name": "d", "type": 9}], [["soon"]]),
+        ([{"name": "u", "type": 11}], [["not-a-uuid"]]),  # UUID
+        ([{"name": "u", "type": 11}], [[["a", "b"]]]),
+    ],
+)
+def test_a_malformed_cell_is_an_interface_error(columns, rows):
+    with pytest.raises(camusdb.InterfaceError, match="malformed"):
+        proto.parse_query({"status": "ok", "columns": columns, "rows": rows})
+
+
+def test_a_jsonb_cell_nested_too_deep_is_an_interface_error():
+    deep: list = []
+    for _ in range(5000):
+        deep = [deep]
+    with pytest.raises(camusdb.InterfaceError, match="malformed"):
+        proto.parse_query(
+            {"status": "ok", "columns": [{"name": "j", "type": 13}], "rows": [[deep]]}
+        )
+
+
+def test_malformed_replies_are_interface_errors():
+    with pytest.raises(camusdb.InterfaceError, match="malformed"):
+        proto.parse_start_transaction({"status": "ok"}, "http://a")
+    with pytest.raises(camusdb.InterfaceError, match="malformed"):
+        proto.parse_non_query({"status": "ok", "rows": "abc"})
+    with pytest.raises(camusdb.InterfaceError, match="malformed"):
+        proto.parse_rowcount({"rows": float("inf")})
+
+
+def test_a_json_body_too_deep_for_the_parser_is_an_interface_error(monkeypatch):
+    def too_deep(content):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(proto.json, "loads", too_deep)
+    with pytest.raises(camusdb.InterfaceError, match="no JSON object"):
+        proto.parse_response(200, b"[[[]]]")
+
+
+def test_a_malformed_stream_line_is_an_interface_error():
+    decoder = proto.StreamDecoder()
+    decoder.header(b'{"status": "ok", "columns": [{"name": "n", "type": 12}]}')
+    with pytest.raises(camusdb.InterfaceError, match="malformed"):
+        decoder.row(b'["x"]')
+    with pytest.raises(camusdb.InterfaceError, match="malformed"):
+        decoder.row(b"[1,")
+
+
+def test_sanitize_masks_a_basic_header():
+    assert "dXNlcjpzZWNyZXQ" not in proto.sanitize("Authorization: Basic dXNlcjpzZWNyZXQ=")

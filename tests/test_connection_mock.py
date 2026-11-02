@@ -1,5 +1,6 @@
 """Connection behavior against a fake server: what the driver sends, and how it reacts."""
 
+import hashlib
 import json
 import threading
 import time
@@ -11,7 +12,9 @@ import camusdb
 import camusdb._auth
 from camusdb import codes
 from camusdb._auth import TOKENS, Token
+from camusdb._config import build_config
 from camusdb._endpoints import EndpointPool
+from camusdb._transport import LineSplitter
 
 
 class FakeServer:
@@ -537,3 +540,80 @@ def test_an_unreachable_endpoint_is_paused(server, connect):
     assert pool.is_quarantined("http://localhost:9200")
     for _ in range(3):
         conn.execute("SELECT 1")
+
+
+def test_a_writable_cte_runs_as_a_write_with_the_autocommit_options(server, connect):
+    conn = connect(autocommit=True, isolation_level="ReadCommitted")
+    conn.execute("WITH x AS (SELECT 1) DELETE FROM t")
+    path, body, _ = server.requests[0]
+    assert path == "/execute-sql-non-query"
+    assert body["isolationLevel"] == "ReadCommitted"
+
+
+def test_a_malformed_stream_row_is_an_interface_error(server, connect):
+    lines = [{"status": "ok", "columns": [{"name": "x", "type": 12}]}, ["12.34abc"]]
+    server.handlers["/execute-sql-query-stream"] = lambda body, req: httpx.Response(
+        200, content="\n".join(json.dumps(line) for line in lines)
+    )
+    conn = connect(autocommit=True)
+    with pytest.raises(camusdb.InterfaceError, match="malformed"):
+        list(conn.cursor().stream("SELECT x FROM t"))
+
+
+def test_a_malformed_insert_count_is_an_interface_error(server, connect):
+    server.handlers["/insert"] = lambda body, req: {"status": "ok", "rows": "many"}
+    conn = connect(autocommit=True)
+    with pytest.raises(camusdb.InterfaceError, match="malformed"):
+        conn.cursor().insert("robots", {"name": "T-800"})
+
+
+class TestLineSplitter:
+    def test_lines_across_chunks(self):
+        splitter = LineSplitter()
+        assert splitter.feed(b'{"a"') == []
+        assert splitter.feed(b": 1}\n\n [1") == [b'{"a": 1}']
+        assert splitter.feed(b"]\n[2]\r\n[3") == [b"[1]", b"[2]"]
+        assert splitter.finish() == [b"[3"]
+        assert splitter.finish() == []
+
+    def test_a_long_line_in_small_chunks_takes_linear_time(self):
+        # 8 MB with no newline in 1 KB chunks. The old buffer copied all of it for each chunk, which
+        # took about 9 s; a linear buffer takes milliseconds.
+        splitter = LineSplitter()
+        chunk = b"x" * 1024
+        start = time.perf_counter()
+        for _ in range(8 * 1024):
+            assert splitter.feed(chunk) == []
+        assert splitter.finish() == [chunk * 8 * 1024]
+        assert time.perf_counter() - start < 2.0
+
+
+class TestTokenStore:
+    def setup_method(self):
+        TOKENS.clear()
+
+    def test_the_key_holds_no_plain_hash_of_the_password(self):
+        auth = camusdb._auth.AuthState(build_config(None, _CREDENTIALS))
+        plain = hashlib.sha256(b"hunter2").hexdigest()
+        assert plain not in repr(auth._key)
+        assert auth._key == camusdb._auth.AuthState(build_config(None, _CREDENTIALS))._key
+
+    def test_old_credentials_are_evicted(self, monkeypatch):
+        monkeypatch.setattr(camusdb._auth, "MAX_CACHED_CREDENTIALS", 3)
+        auth = camusdb._auth.AuthState(build_config(None, _CREDENTIALS))
+        keys = []
+        for i in range(5):
+            auth.set_credentials("app", f"password-{i}")
+            auth.login_lock()
+            auth.store(f"token-{i}", 600)
+            keys.append(auth._key)
+        assert [TOKENS.get(key) is not None for key in keys] == [False, False, True, True, True]
+        assert len(TOKENS._login_locks) <= 3 + 1
+
+
+_CREDENTIALS = {
+    "endpoint": "http://localhost:1",
+    "database": "d",
+    "user": "app",
+    "password": "hunter2",
+}

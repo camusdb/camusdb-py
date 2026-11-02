@@ -47,14 +47,15 @@ def to_text(value: Any) -> str:
 
     The value can be a ``dict`` with ``str`` keys, a ``list``, a ``tuple``, a ``str``, an ``int``, a
     finite ``float``, a ``Decimal``, a ``bool`` or ``None``. A ``TypeError`` or a ``ValueError`` comes
-    for a value that JSON cannot hold.
+    for a value that JSON cannot hold, and a ``ValueError`` for a document nested more than
+    ``MAX_NESTING_DEPTH`` levels deep.
     """
     out: list[str] = []
-    _append(value, out)
+    _append(value, out, 0)
     return "".join(out)
 
 
-def _append(value: Any, out: list[str]) -> None:
+def _append(value: Any, out: list[str], depth: int) -> None:
     # bool before int: a bool is an int in Python. _Number before str: a _Number is a str.
     if value is None:
         out.append("null")
@@ -78,6 +79,10 @@ def _append(value: Any, out: list[str]) -> None:
         if not value.is_finite():
             raise ValueError(f"{value} is not a finite number, which JSON cannot hold")
         out.append(str(value))
+    elif isinstance(value, (Mapping, list, tuple)) and depth >= MAX_NESTING_DEPTH:
+        # The server stores no deeper document. The bound also keeps the recursion of this function
+        # far from the interpreter's limit, for a value from an application or from a response.
+        raise ValueError(f"the document is nested more than {MAX_NESTING_DEPTH} levels deep")
     elif isinstance(value, Mapping):
         out.append("{")
         for i, (key, item) in enumerate(value.items()):
@@ -87,14 +92,14 @@ def _append(value: Any, out: list[str]) -> None:
                 out.append(", ")
             out.append(json.dumps(key, ensure_ascii=False))
             out.append(": ")
-            _append(item, out)
+            _append(item, out, depth + 1)
         out.append("}")
     elif isinstance(value, (list, tuple)):
         out.append("[")
         for i, item in enumerate(value):
             if i:
                 out.append(", ")
-            _append(item, out)
+            _append(item, out, depth + 1)
         out.append("]")
     else:
         raise TypeError(f"{type(value).__name__} cannot be held in a JSON document")

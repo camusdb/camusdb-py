@@ -107,3 +107,29 @@ class TestBuildConfig:
     def test_an_unknown_keyword_is_a_type_error(self):
         with pytest.raises(TypeError):
             build_config(None, {"endpoint": "http://a:1", "database": "d", "colour": "blue"})
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "http://user:secret@db:5095",
+            "http://user@localhost:5095",
+            "https://:secret@db:5095",
+            "http://user:a secret@db:5095",
+        ],
+    )
+    def test_credentials_in_the_url_are_refused(self, endpoint):
+        # httpx sends URL credentials as a Basic header, also over plain HTTP.
+        with pytest.raises(camusdb.ProgrammingError, match="user name or a password") as info:
+            build_config(f"Endpoint={endpoint};Database=d", {})
+        assert "secret" not in str(info.value)
+
+    @pytest.mark.parametrize(
+        "endpoint", ["http://db:5095/a/../b", "http://db:5095/./x", "http://db:port", "http://:1"]
+    )
+    def test_an_endpoint_with_a_bad_part_is_refused(self, endpoint):
+        with pytest.raises(camusdb.ProgrammingError):
+            build_config(None, {"endpoint": endpoint, "database": "d"})
+
+    def test_an_endpoint_with_a_base_path_is_accepted(self):
+        config = build_config(None, {"endpoint": "http://db:5095/camus/", "database": "d"})
+        assert config.endpoints == ("http://db:5095/camus",)

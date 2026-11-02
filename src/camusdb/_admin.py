@@ -15,7 +15,7 @@ from typing import Any
 from urllib.parse import quote
 
 from . import codes
-from ._protocol import expect_ok
+from ._protocol import decoder, expect_ok
 from .errors import InterfaceError, ProgrammingError
 
 __all__ = [
@@ -161,6 +161,7 @@ class NodeStats:
         return next((d for d in self.disks if d.role == DiskVolumeStats.DATA_ROLE), None)
 
 
+@decoder("node stats")
 def parse_node_stats(body: Mapping[str, Any], address: str) -> NodeStats:
     expect_ok(body, "node stats failed")
     node = _section(body, "node")
@@ -295,6 +296,7 @@ class BackupGcResult:
     orphan_reclamations: tuple[BackupGcOrphan, ...]
 
 
+@decoder("backup")
 def parse_backup(body: Mapping[str, Any], fallback: str) -> BackupInfo:
     expect_ok(body, fallback)
     backup = body.get("backup")
@@ -303,11 +305,13 @@ def parse_backup(body: Mapping[str, Any], fallback: str) -> BackupInfo:
     return _backup_info(backup)
 
 
+@decoder("backup list")
 def parse_backup_list(body: Mapping[str, Any], fallback: str) -> list[BackupInfo]:
     expect_ok(body, fallback)
     return [_backup_info(item) for item in _items(body, "backups")]
 
 
+@decoder("backup garbage collection")
 def parse_backup_gc(body: Mapping[str, Any]) -> BackupGcResult:
     expect_ok(body, "backup garbage collection failed")
     return BackupGcResult(

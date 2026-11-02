@@ -18,9 +18,12 @@ The driver sends that login again, up to three times, after a short random wait.
 from __future__ import annotations
 
 import hashlib
+import hmac
+import os
 import random
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 
 from . import codes
@@ -29,6 +32,21 @@ from .errors import Error
 
 RENEW_AT = 0.80
 EXPIRE_AT = 0.95
+
+# The most sets of credentials whose tokens the process keeps. A service that changes its password
+# from time to time must not keep a live token for each old password. When the store is full, the
+# set used least recently loses its token, and its next statement logs in again.
+MAX_CACHED_CREDENTIALS = 64
+
+# The key of the credentials digest. It is random and new in each process, so a digest read from a
+# memory dump cannot be checked against a guessed password without this key too.
+_DIGEST_KEY = os.urandom(32)
+
+
+def password_digest(password: str) -> str:
+    """A digest of ``password`` that identifies it in the token store, and in nothing else."""
+    return hmac.new(_DIGEST_KEY, password.encode(), hashlib.sha256).hexdigest()
+
 
 # The minimum time between a failed background renewal and the next one, in seconds. The token is
 # still valid, so the wait costs nothing. Without the wait, each statement after a failed renewal
@@ -76,7 +94,8 @@ class Token:
 
 class _TokenStore:
     def __init__(self) -> None:
-        self._tokens: dict[tuple[object, ...], Token] = {}
+        # Least recently used first.
+        self._tokens: OrderedDict[tuple[object, ...], Token] = OrderedDict()
         self._login_locks: dict[tuple[object, ...], threading.Lock] = {}
         # The keys that have a background renewal in flight: at most one for each key.
         self._renewing: set[tuple[object, ...]] = set()
@@ -92,11 +111,19 @@ class _TokenStore:
 
     def get(self, key: tuple[object, ...]) -> Token | None:
         with self._lock:
-            return self._tokens.get(key)
+            token = self._tokens.get(key)
+            if token is not None:
+                self._tokens.move_to_end(key)
+            return token
 
     def put(self, key: tuple[object, ...], token: Token) -> None:
         with self._lock:
             self._tokens[key] = token
+            self._tokens.move_to_end(key)
+            while len(self._tokens) > MAX_CACHED_CREDENTIALS:
+                oldest, _ = self._tokens.popitem(last=False)
+                self._forget(oldest)
+            self._prune_locks()
 
     def discard(self, key: tuple[object, ...], value: str | None = None) -> None:
         """Forget the token, but only if it is still ``value``: a newer token stays."""
@@ -107,7 +134,25 @@ class _TokenStore:
 
     def login_lock(self, key: tuple[object, ...]) -> threading.Lock:
         with self._lock:
-            return self._login_locks.setdefault(key, threading.Lock())
+            lock = self._login_locks.get(key)
+            if lock is None:
+                self._prune_locks()
+                lock = self._login_locks[key] = threading.Lock()
+            return lock
+
+    def _forget(self, key: tuple[object, ...]) -> None:
+        # The renewal state of a key without a token. A renewal in flight ends by itself.
+        self._renewal_retry_after.pop(key, None)
+
+    def _prune_locks(self) -> None:
+        # A lock is dropped only when its key has no token and nobody holds it. A thread that took
+        # the lock object before the drop still uses it, and at worst two logins run at the same
+        # time, which costs a login but is correct.
+        if len(self._login_locks) <= MAX_CACHED_CREDENTIALS:
+            return
+        for key in [k for k in self._login_locks if k not in self._tokens]:
+            if not self._login_locks[key].locked():
+                del self._login_locks[key]
 
     def begin_renewal(self, key: tuple[object, ...]) -> bool:
         """Claim the background renewal of ``key``. False when one is in flight, or must wait."""
@@ -146,7 +191,7 @@ class AuthState:
     def set_credentials(self, user: str | None, password: str | None) -> None:
         self.user = user
         self._password = password
-        digest = hashlib.sha256(password.encode()).hexdigest() if password is not None else None
+        digest = password_digest(password) if password is not None else None
         self._key = (self._endpoints, user, digest)
 
     @property

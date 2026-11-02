@@ -20,6 +20,13 @@ from camusdb._sql import (
         ("-- leading comment\nSELECT 1", StatementKind.QUERY),
         ("/* block */ SHOW TABLES", StatementKind.QUERY),
         ("WITH x AS (SELECT 1) SELECT * FROM x", StatementKind.QUERY),
+        ("WITH x AS (SELECT a FROM t FOR UPDATE) SELECT * FROM x", StatementKind.QUERY),
+        ("WITH x (a) AS (VALUES (1)) SELECT (SELECT 1) FROM x", StatementKind.QUERY),
+        ("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d", StatementKind.NON_QUERY),
+        ("WITH d AS MATERIALIZED (UPDATE t SET a = 1) SELECT 1", StatementKind.NON_QUERY),
+        ("WITH RECURSIVE x AS (SELECT 1) INSERT INTO t SELECT * FROM x", StatementKind.NON_QUERY),
+        ("with x as (select 1), y as (select 2) delete from t", StatementKind.NON_QUERY),
+        ("WITH x AS (SELECT 'DELETE' AS `update`) SELECT * FROM x", StatementKind.QUERY),
         ("EXPLAIN SELECT 1", StatementKind.QUERY),
         ("DESCRIBE robots", StatementKind.QUERY),
         ("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", StatementKind.QUERY),
@@ -75,6 +82,26 @@ def test_writes(sql):
 
 def test_a_query_is_not_a_write():
     assert not is_dml("SELECT upsert FROM t")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+        "WITH x AS (SELECT 1) UPDATE t SET a = 1",
+        "/* c */ WITH x AS (SELECT 1) UPSERT INTO t (a) VALUES (1)",
+    ],
+)
+def test_a_writable_cte_is_a_write(sql):
+    assert is_dml(sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    ["WITH x AS (SELECT 1) SELECT * FROM x", "WITH x AS (SELECT 1) SELECT * FROM x FOR UPDATE"],
+)
+def test_a_reading_cte_is_not_a_write(sql):
+    assert not is_dml(sql)
 
 
 def test_truncate_runs_in_its_own_transaction():

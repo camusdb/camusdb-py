@@ -11,6 +11,7 @@ import base64
 import datetime as dt
 import decimal
 import math
+import re
 import struct
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
@@ -25,6 +26,7 @@ WireValue = dict[str, Any]
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
 _UINT64_MASK = 2**64 - 1
+_INT64_TEXT = re.compile(r"[+-]?[0-9]+")
 
 # .NET DateTime ticks: 100-nanosecond intervals since 0001-01-01T00:00:00Z.
 _TICKS_EPOCH = dt.datetime(1, 1, 1, tzinfo=dt.timezone.utc)
@@ -215,6 +217,9 @@ def _encode_array(name: str, value: Any, element_type: ColumnType | None) -> Wir
 def _to_int64(name: str, value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, decimal.Decimal, float, str)):
         raise TypeError(f"expected an int, got {type(value).__name__}")
+    # int() also reads "1_000", white space and non-ASCII digits, which the server does not.
+    if isinstance(value, str) and not _INT64_TEXT.fullmatch(value):
+        raise ValueError(f"{value!r} is not a whole number")
     number = int(value)
     if number != value and not isinstance(value, str):
         raise ValueError(f"{value!r} is not a whole number")
@@ -391,7 +396,7 @@ def decode_cell(
         case ColumnType.ID:
             return str(cell)
         case ColumnType.BYTES:
-            return base64.b64decode(cell)
+            return base64.b64decode(cell, validate=True)
         case ColumnType.DATE:
             return ticks_to_date(int(cell))
         case ColumnType.DATETIME:

@@ -603,7 +603,7 @@ class Cursor:
         except Error:
             state.statement_failed()
             raise
-        self._state.rowcount = int(body.get("rows") or 0)
+        self._state.rowcount = proto.parse_rowcount(body)
         return self._state.rowcount
 
     def fetchone(self) -> Any:

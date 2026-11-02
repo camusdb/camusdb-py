@@ -291,16 +291,56 @@ def _endpoints(raw: Any) -> tuple[str, ...]:
         endpoint = str(item).strip().rstrip("/")
         if not endpoint:
             continue
+        # Before the other checks, so that no error text repeats the password.
+        _check_userinfo(endpoint)
         if not _ENDPOINT.fullmatch(endpoint):
             raise ProgrammingError(
                 f"{endpoint!r} is not an endpoint: expected an http:// or https:// URL",
                 codes.INVALID_INPUT,
             )
+        _check_endpoint_parts(endpoint)
         if endpoint not in endpoints:
             endpoints.append(endpoint)
     if not endpoints:
         raise ProgrammingError("an endpoint is required", codes.INVALID_INPUT)
     return tuple(endpoints)
+
+
+def _check_userinfo(endpoint: str) -> None:
+    """Refuse a user name or a password in the URL.
+
+    httpx sends them as an ``Authorization: Basic`` header on each request, also over plain HTTP, and
+    the server does not read that header. The credentials go in ``user`` and ``password``.
+    """
+    parts = urlsplit(endpoint)
+    if "@" in parts.netloc:
+        host = parts.netloc.rpartition("@")[2]
+        raise ProgrammingError(
+            f"the endpoint '{parts.scheme}://***@{host}' has a user name or a password in the URL; "
+            "give them as user and password instead",
+            codes.INVALID_INPUT,
+        )
+
+
+def _check_endpoint_parts(endpoint: str) -> None:
+    """Refuse a host that is missing, a port that is not valid, and a ``.`` or ``..`` path segment.
+
+    httpx removes a ``.`` or ``..`` segment, so the request would go to a different path than the
+    one configured.
+    """
+    parts = urlsplit(endpoint)
+    if not parts.hostname:
+        raise ProgrammingError(f"the endpoint {endpoint!r} has no host", codes.INVALID_INPUT)
+    try:
+        parts.port  # noqa: B018 - the property raises ValueError for a port that is not valid
+    except ValueError:
+        raise ProgrammingError(
+            f"the endpoint {endpoint!r} has a port that is not valid", codes.INVALID_INPUT
+        ) from None
+    if any(segment in {".", ".."} for segment in parts.path.split("/")):
+        raise ProgrammingError(
+            f"the endpoint {endpoint!r} has a '.' or '..' path segment", codes.INVALID_INPUT
+        )
 
 
 def _backup_endpoint(raw: Any) -> str | None:

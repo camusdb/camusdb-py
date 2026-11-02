@@ -129,7 +129,7 @@ class Transport:
                                 self.auth.discard(token)
                                 continue
                             raise
-                    yield (line for line in _lines(response.iter_bytes()) if line)
+                    yield _lines(response.iter_bytes())
                     return
             except httpx.HTTPError as exc:
                 raise translate_transport_error(self.pool, endpoint, exc) from exc
@@ -253,13 +253,39 @@ def _bearer(token: str | None) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
+class LineSplitter:
+    """Splits a byte stream into its non-empty lines, in time linear in the stream length.
+
+    Lines are split on the newline byte only. A JSON text has no raw newline, so this is exact, and it
+    is faster than a text decode of each chunk. The buffer holds only the part of the last line that is not
+    complete, and each byte is copied a fixed number of times, also when a line is very long.
+    """
+
+    def __init__(self) -> None:
+        self._pending = bytearray()
+
+    def feed(self, chunk: bytes) -> list[bytes]:
+        """The lines that ``chunk`` completes."""
+        # The pending bytes hold no newline, so the search starts in the new chunk.
+        start = len(self._pending)
+        self._pending += chunk
+        cut = self._pending.find(b"\n", start)
+        if cut < 0:
+            return []
+        cut = self._pending.rfind(b"\n")
+        complete = bytes(self._pending[:cut])
+        del self._pending[: cut + 1]
+        return [line for line in (part.strip() for part in complete.split(b"\n")) if line]
+
+    def finish(self) -> list[bytes]:
+        """The last line, when the stream did not end with a newline."""
+        line = bytes(self._pending).strip()
+        self._pending.clear()
+        return [line] if line else []
+
+
 def _lines(chunks: Iterator[bytes]) -> Iterator[bytes]:
-    # Lines are split on b"\n" only. A JSON text has no raw newline, so this is exact, and it is
-    # faster than a text decode of each chunk.
-    pending = b""
+    splitter = LineSplitter()
     for chunk in chunks:
-        pending += chunk
-        *complete, pending = pending.split(b"\n")
-        yield from (line.strip() for line in complete)
-    if pending.strip():
-        yield pending.strip()
+        yield from splitter.feed(chunk)
+    yield from splitter.finish()
