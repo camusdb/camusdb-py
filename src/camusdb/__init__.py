@@ -61,7 +61,7 @@ from .types import (
     Typed,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 # PEP 249 module globals.
 apilevel = "2.0"
