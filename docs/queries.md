@@ -49,6 +49,12 @@ conn.execute(
 
 To make a new object id in Python, use `camusdb.ObjectId.generate()`.
 
+`inf`, `-inf` and `nan` are float values too. JSON has no number for them, so the driver sends a
+`FLOAT64` or `FLOAT32` parameter with one of these values as the string `"Infinity"`, `"-Infinity"` or
+`"NaN"`. In a `FLOAT64` or `FLOAT32` cell or array element, the driver reads these three strings as
+the float value. Any other string stays a `str`. A server that is older than the PostgreSQL float
+rule cannot return these values, and it refuses them in a parameter.
+
 ## JSONB
 
 A `JSONB` column (alias `JSON`) holds one JSON document. The SQL follows PostgreSQL `jsonb`: the
@@ -147,3 +153,43 @@ conn.cursor().insert(
     "robots", {"id": camusdb.ObjectId.generate(), "name": "HAL 9000", "year": 1968}
 )
 ```
+
+## Inline functions
+
+An inline function is a scalar function. Its C# body is dollar-quoted text in `CREATE FUNCTION`.
+The operator deploys no DLL. The user needs the `CREATE` privilege on the database, not superuser.
+The server setting `inline_functions_enabled` must be `true`.
+
+```python
+conn.execute("""
+    CREATE OR REPLACE FUNCTION slugify(s STRING) RETURNS STRING LANGUAGE csharp AS $$
+        return s.Trim().ToLowerInvariant().Replace(' ', '-');
+    $$
+""")
+conn.execute("SELECT slugify(title) FROM posts").fetchall()
+```
+
+- `CREATE [OR REPLACE] FUNCTION`, `DROP FUNCTION` and `ALTER FUNCTION ... OWNER TO` are schema
+  changes. `CREATE EXTENSION`, `ALTER EXTENSION` and `DROP EXTENSION` are schema changes too.
+- The driver sends the body as you write it. If the body holds `$$`, use a tagged quote:
+  `$fn$ ... $fn$`.
+- The driver reads dollar-quoted text as one literal, so a word in the body is not a keyword.
+- `SHOW FUNCTIONS` and `SHOW CREATE FUNCTION name` return rows.
+- The types are `INT64`, `FLOAT64`, `FLOAT32`, `BOOL`, `STRING`, `UUID`, `BYTES`, `DATETIME`,
+  `NUMERIC` and `ARRAY(E)`.
+
+`camusdb.codes` names the error codes:
+
+| Code | Name | When |
+| --- | --- | --- |
+| `CADB0838` | `INLINE_FUNCTION_COMPILE_FAILED` | The body does not compile. |
+| `CADB0839` | `INLINE_FUNCTION_REFUSED` | The body uses a type or a member that is not allowed. |
+| `CADB0840` | `INLINE_FUNCTION_BUDGET_EXCEEDED` | A call went over its time, memory, array or stack budget. |
+| `CADB0841` | `INLINE_FUNCTIONS_DISABLED` | The feature is off. |
+| `CADB0842` | `FUNCTION_ALREADY_EXISTS` | The name is taken. |
+| `CADB0843` | `FUNCTION_NOT_FOUND` | No function has that name. |
+| `CADB0844` | `FUNCTION_HAS_DEPENDENTS` | A view or a `CHECK` uses the function. |
+| `CADB0845` | `INLINE_FUNCTION_UNAVAILABLE_ON_NODE` | This node cannot compile the function. |
+| `CADB0809` | `EXTENSION_FUNCTION_FAILED` | The body threw an exception. |
+
+The driver retries none of these errors.

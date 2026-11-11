@@ -1,6 +1,7 @@
 import datetime as dt
 import decimal
 import json
+import math
 import uuid
 
 import pytest
@@ -83,10 +84,19 @@ class TestEncode:
         with pytest.raises(camusdb.DataError, match="INT64"):
             encode_value("@p", 2**63)
 
-    @pytest.mark.parametrize("value", [float("nan"), float("inf")])
-    def test_a_float_that_json_cannot_hold_is_refused(self, value):
+    @pytest.mark.parametrize(
+        ("value", "name"),
+        [(float("inf"), "Infinity"), (float("-inf"), "-Infinity"), (float("nan"), "NaN")],
+    )
+    def test_a_float_that_json_cannot_hold_is_sent_by_name(self, value, name):
+        assert encode_value("@p", value) == {"type": ColumnType.FLOAT64, "floatValue": name}
+        assert encode_value("@p", Typed(value, ColumnType.FLOAT32))["floatValue"] == name
+        assert encode_value("@p", [1.5, value])["arrayValues"][1]["floatValue"] == name
+        json.dumps(encode_parameters({"p": value}), allow_nan=False)
+
+    def test_a_non_finite_numeric_is_refused(self):
         with pytest.raises(camusdb.DataError):
-            encode_value("@p", value)
+            encode_value("@p", Typed(float("nan"), ColumnType.NUMERIC))
 
     def test_datetime_is_sent_as_utc_ticks(self):
         aware = dt.datetime(2026, 5, 1, 12, 0, tzinfo=dt.timezone(dt.timedelta(hours=2)))
@@ -218,6 +228,28 @@ class TestDecode:
 
     def test_a_float64_zero_is_a_float(self):
         assert isinstance(decode_cell(0, ColumnType.FLOAT64), float)
+
+    @pytest.mark.parametrize("declared", [ColumnType.FLOAT64, ColumnType.FLOAT32])
+    def test_a_non_finite_float_cell_is_a_float(self, declared):
+        assert decode_cell("Infinity", declared) == float("inf")
+        assert decode_cell("-Infinity", declared) == float("-inf")
+        assert math.isnan(decode_cell("NaN", declared))
+
+    def test_a_non_finite_float_array_element_is_a_float(self):
+        schema = read_schema(
+            [{"name": "v", "type": ColumnType.ARRAY.value, "elementType": ColumnType.FLOAT32.value}]
+        )
+        (values,) = decode_row(schema, [[1.5, "Infinity", None, "-Infinity", "NaN"]])
+        assert values[:4] == [1.5, float("inf"), None, float("-inf")]
+        assert math.isnan(values[4])
+
+    @pytest.mark.parametrize("cell", ["infinity", "inf", "nan", "Infinity ", "abc", ""])
+    def test_another_string_in_a_float_column_stays_a_string(self, cell):
+        assert decode_cell(cell, ColumnType.FLOAT64) == cell
+
+    def test_the_names_are_floats_in_a_float_column_only(self):
+        assert decode_cell("NaN", ColumnType.STRING) == "NaN"
+        assert decode_cell("Infinity", ColumnType.NULL) == "Infinity"
 
     def test_a_missing_position_is_none(self):
         schema = read_schema([{"name": "a", "type": 2}, {"name": "b", "type": 2}])

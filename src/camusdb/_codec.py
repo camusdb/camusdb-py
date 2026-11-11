@@ -141,7 +141,7 @@ def _encode_as(
             case ColumnType.INT64:
                 return {"type": ColumnType.INT64, "longValue": _to_int64(name, value)}
             case ColumnType.FLOAT64 | ColumnType.FLOAT32:
-                return {"type": column_type, "floatValue": _to_finite_float(name, value)}
+                return {"type": column_type, "floatValue": _to_float(name, value)}
             case ColumnType.NUMERIC:
                 return {"type": ColumnType.NUMERIC, "strValue": _to_numeric_text(name, value)}
             case ColumnType.BOOL:
@@ -228,13 +228,19 @@ def _to_int64(name: str, value: Any) -> int:
     return number
 
 
-def _to_finite_float(name: str, value: Any) -> float:
+# JSON has no number for infinity or NaN. The server reads these strings in a float parameter, and
+# writes them in a FLOAT64 or FLOAT32 cell or array element. Kept in step with the .NET driver.
+_NON_FINITE_FLOATS = {"Infinity": math.inf, "-Infinity": -math.inf, "NaN": math.nan}
+
+
+def _to_float(name: str, value: Any) -> float | str:
     if isinstance(value, bool):
         raise TypeError("expected a float, got bool")
     number = float(value)
-    if not math.isfinite(number):
-        # JSON has no NaN or infinity.
-        raise ValueError(f"{number} is not a finite number")
+    if math.isnan(number):
+        return "NaN"
+    if math.isinf(number):
+        return "Infinity" if number > 0 else "-Infinity"
     return number
 
 
@@ -416,7 +422,12 @@ def decode_cell(
 
 
 def _decode_by_token(cell: Any, declared: ColumnType) -> Any:
-    if isinstance(cell, (bool, str)):
+    if isinstance(cell, str):
+        if declared in (ColumnType.FLOAT64, ColumnType.FLOAT32) and cell in _NON_FINITE_FLOATS:
+            # Infinity, -Infinity or NaN, which JSON has no number for. Any other string stays a str.
+            return _NON_FINITE_FLOATS[cell]
+        return cell
+    if isinstance(cell, bool):
         return cell
     if isinstance(cell, (int, float)):
         if declared == ColumnType.FLOAT64:

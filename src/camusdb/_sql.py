@@ -7,7 +7,8 @@ The server has three SQL endpoints, and a statement sent to the wrong one fails 
 * the non-query endpoint runs everything else (``INSERT``, ``UPDATE``, ``CREATE USER``, ``GRANT`` ...).
 
 The scanner reads keywords only. It skips white space, comments, opening parentheses, string
-literals and quoted identifiers, so a keyword inside one of these does not count.
+literals, dollar-quoted text (``$$ ... $$``) and quoted identifiers, so a keyword inside one of these
+does not count.
 """
 
 from __future__ import annotations
@@ -51,6 +52,16 @@ _DDL_PREFIXES: tuple[tuple[str, ...], ...] = (
     ("ALTER", "SEQUENCE"),
     ("CREATE", "TRIGGER"),
     ("DROP", "TRIGGER"),
+    # Extension assemblies installed in a database: CREATE EXTENSION, ALTER EXTENSION ... UPDATE,
+    # DROP EXTENSION.
+    ("CREATE", "EXTENSION"),
+    ("ALTER", "EXTENSION"),
+    ("DROP", "EXTENSION"),
+    # Inline functions, whose C# body is dollar-quoted text. ALTER FUNCTION is the OWNER TO form.
+    ("CREATE", "FUNCTION"),
+    ("CREATE", "OR", "REPLACE", "FUNCTION"),
+    ("DROP", "FUNCTION"),
+    ("ALTER", "FUNCTION"),
 )
 
 
@@ -96,9 +107,18 @@ def _words(sql: str, limit: int | None = None) -> list[_Word]:
         elif c in "'\"`":
             i = _skip_quoted(sql, i, c)
             opens = False
+        elif c == "$" and _dollar_quote_length(sql, i) > 0:
+            # The C# body of CREATE FUNCTION: one literal, so its words are not keywords.
+            i = _skip_dollar_quoted(sql, i)
+            opens = False
         elif c.isalpha() or c == "_":
             start = i
-            while i < n and (sql[i].isalnum() or sql[i] == "_"):
+            # A word can hold "$" (price$), but it stops where a dollar quote opens (AS$fn$).
+            while i < n and (
+                sql[i].isalnum()
+                or sql[i] == "_"
+                or (sql[i] == "$" and _dollar_quote_length(sql, i) == 0)
+            ):
                 i += 1
             words.append(_Word(sql[start:i].upper(), depth, opens))
             opens = False
@@ -124,6 +144,42 @@ def _skip_quoted(sql: str, start: int, quote: str) -> int:
         else:
             i += 1
     return n
+
+
+def _dollar_quote_length(sql: str, start: int) -> int:
+    """The length of the dollar quote that opens at ``start``: ``$$``, or ``$tag$`` as in ``$fn$``.
+
+    Zero when the character there opens no quote. The rule is the server lexer's: a tag is a letter or
+    ``_``, then letters, digits or ``_``, all ASCII.
+    """
+    n = len(sql)
+    if start >= n or sql[start] != "$":
+        return 0
+    i = start + 1
+    if i < n and (_is_ascii_letter(sql[i]) or sql[i] == "_"):
+        while i < n and (_is_ascii_letter(sql[i]) or sql[i] in _ASCII_DIGITS or sql[i] == "_"):
+            i += 1
+    return i + 1 - start if i < n and sql[i] == "$" else 0
+
+
+def _skip_dollar_quoted(sql: str, start: int) -> int:
+    """The index after the dollar-quoted text that opens at ``start``.
+
+    The text between two equal quotes is raw: quotes, semicolons and comments in it are text, with no
+    escape. With no closing quote, the rest of the text is in it, as the server's script splitter reads
+    it. The caller first makes sure that a quote opens at ``start``.
+    """
+    length = _dollar_quote_length(sql, start)
+    quote = sql[start : start + length]
+    close = sql.find(quote, start + length)
+    return len(sql) if close < 0 else close + length
+
+
+_ASCII_DIGITS = frozenset("0123456789")
+
+
+def _is_ascii_letter(c: str) -> bool:
+    return ("a" <= c <= "z") or ("A" <= c <= "Z")
 
 
 def classify(sql: str) -> StatementKind:

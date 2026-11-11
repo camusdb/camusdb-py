@@ -51,6 +51,23 @@ from camusdb._sql import (
         ("ALTER TABLE t ADD COLUMN c INT64", StatementKind.DDL),
         ("DROP SEQUENCE s", StatementKind.DDL),
         ("CREATE TRIGGER audit ON orders AFTER INSERT EXTERNAL NAME 'X'", StatementKind.DDL),
+        ("CREATE EXTENSION geo VERSION '1.2.0'", StatementKind.DDL),
+        ("ALTER EXTENSION geo UPDATE", StatementKind.DDL),
+        ("DROP EXTENSION geo", StatementKind.DDL),
+        (
+            "CREATE FUNCTION slugify(s STRING) RETURNS STRING LANGUAGE csharp AS $$\n"
+            "    return s.Trim().Replace(' ', '-');\n$$",
+            StatementKind.DDL,
+        ),
+        (
+            "create or replace function twice(n INT64) RETURNS INT64 LANGUAGE csharp "
+            "AS $fn$ return n * 2; $fn$",
+            StatementKind.DDL,
+        ),
+        ("DROP FUNCTION IF EXISTS slugify", StatementKind.DDL),
+        ("ALTER FUNCTION slugify OWNER TO alice", StatementKind.DDL),
+        ("SHOW FUNCTIONS", StatementKind.QUERY),
+        ("SHOW CREATE FUNCTION slugify", StatementKind.QUERY),
         ("", StatementKind.NON_QUERY),
     ],
 )
@@ -70,6 +87,52 @@ def test_a_backslash_escapes_the_next_character():
 def test_returning():
     assert has_returning("INSERT INTO t (a) VALUES (1) RETURNING id")
     assert not has_returning("INSERT INTO t (a) VALUES ('RETURNING')")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "INSERT INTO t (a) VALUES ($$ it's $$) RETURNING a",
+        "INSERT INTO t (a) VALUES ($a$ $$ $a$) RETURNING a",
+    ],
+)
+def test_returning_after_dollar_quoted_text(sql):
+    assert has_returning(sql)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "INSERT INTO t (a) VALUES ($$ RETURNING $$)",
+        "INSERT INTO t (a) VALUES ($q$ it's $$ RETURNING $q$)",
+        "INSERT INTO t (a) VALUES ($$ unterminated RETURNING",
+    ],
+)
+def test_returning_inside_dollar_quoted_text_does_not_count(sql):
+    assert not has_returning(sql)
+
+
+def test_dollar_quoted_text_is_one_literal():
+    sql = 'CREATE FUNCTION f(c STRING) RETURNS BOOL LANGUAGE csharp AS $$ return c == "\'"; $$ FROM'
+    assert keywords(sql)[-2:] == ["AS", "FROM"]
+    assert keywords('SELECT f() AS$fn$ return "$$"; $fn$ FROM t') == [
+        "SELECT",
+        "F",
+        "AS",
+        "FROM",
+        "T",
+    ]
+
+
+def test_a_word_can_hold_a_dollar_sign():
+    assert keywords("SELECT price$ FROM t WHERE a = $1") == [
+        "SELECT",
+        "PRICE$",
+        "FROM",
+        "T",
+        "WHERE",
+        "A",
+    ]
 
 
 @pytest.mark.parametrize(
