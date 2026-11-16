@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import decimal
 import enum
 import itertools
 import os
@@ -22,6 +23,7 @@ __all__ = [
     "ColumnType",
     "Date",
     "DateFromTicks",
+    "Interval",
     "IsolationLevel",
     "Locking",
     "ObjectId",
@@ -89,6 +91,200 @@ class Typed:
     value: Any
     type: ColumnType
     element_type: ColumnType | None = None
+
+
+_INT32_MIN = -(2**31)
+_INT32_MAX = 2**31 - 1
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
+_MICROS_PER_SECOND = 1_000_000
+_MICROS_PER_MINUTE = 60 * _MICROS_PER_SECOND
+_MICROS_PER_HOUR = 60 * _MICROS_PER_MINUTE
+_MICROS_PER_DAY = 24 * _MICROS_PER_HOUR
+
+# The precision of the interval parser. A part out of range fails the range check, and is not rounded.
+_INTERVAL_CONTEXT = decimal.Context(prec=60, rounding=decimal.ROUND_HALF_EVEN)
+
+
+@dataclass(frozen=True)
+class Interval:
+    """One SQL ``interval`` value: a number of months, a number of days and a number of microseconds.
+
+    The server keeps the three parts separate, as PostgreSQL does, because a month and a day have no
+    fixed length when they are added to a date.
+
+    **On the wire.** An interval is a value of an expression only: no table column can have this
+    type. A query result sends it as its ISO-8601 text (``P1Y2M3DT4H5M6.5S``) in a ``STRING`` column,
+    so the cell reads as a ``str``. Use :meth:`parse` to read it. A parameter is text too, so the SQL
+    must cast it: ``CAST(@p AS interval)``. An ``Interval`` or a :class:`datetime.timedelta`
+    parameter binds as this text.
+
+    **timedelta.** A ``timedelta`` has days and a time, and no months. So :meth:`to_timedelta`
+    refuses an interval with a month part. The result of ``age(a, b)`` can have one.
+
+    **Equality.** Two values are equal when their three parts are equal. The server compares two
+    intervals by one total, where a month is 30 days and a day is 24 hours, so on the server
+    ``INTERVAL 'P1M' = INTERVAL 'P30D'`` is true. Here the two values are not equal.
+    """
+
+    months: int = 0
+    days: int = 0
+    microseconds: int = 0
+
+    def __post_init__(self) -> None:
+        for name, low, high in (
+            ("months", _INT32_MIN, _INT32_MAX),
+            ("days", _INT32_MIN, _INT32_MAX),
+            ("microseconds", _INT64_MIN, _INT64_MAX),
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"the {name} of an Interval must be an int")
+            if not low <= value <= high:
+                raise OverflowError(f"the {name} of an Interval must be in [{low}, {high}]")
+
+    @classmethod
+    def from_timedelta(cls, value: _dt.timedelta) -> Interval:
+        """The interval of a ``timedelta``: its whole days in the days part, and the rest in the time
+        part. The two parts have the sign of the value, so ``-36 hours`` is ``P-1DT-12H``.
+        """
+        total = value // _dt.timedelta(microseconds=1)
+        days, micros = divmod(abs(total), _MICROS_PER_DAY)
+        sign = -1 if total < 0 else 1
+        return cls(0, sign * days, sign * micros)
+
+    def to_timedelta(self) -> _dt.timedelta:
+        """The ``timedelta`` of this interval: the days times 24 hours, plus the time part.
+
+        A ``ValueError`` comes when the interval has a month part, which a ``timedelta`` cannot hold.
+        An ``OverflowError`` comes when the value is outside the range of a ``timedelta``.
+        """
+        if self.months != 0:
+            raise ValueError(
+                f"the interval {self} has a month part, and a timedelta has no months; keep the "
+                "value as an Interval, or remove the months in SQL with justify_days or a datetime "
+                "difference"
+            )
+        return _dt.timedelta(days=self.days, microseconds=self.microseconds)
+
+    @classmethod
+    def parse(cls, text: str) -> Interval:
+        """Read the ISO-8601 text of an interval, the form the server sends: ``P1Y2M3DT4H5M6.5S``,
+        ``P-1DT2H``, ``PT0S``.
+
+        Each number can have its own sign. Only the seconds can have a fraction, which rounds to a
+        whole microsecond, to even on a tie. A ``ValueError`` comes when the text is not an ISO-8601
+        interval, and an ``OverflowError`` when a part is outside its range.
+        """
+        if not isinstance(text, str):
+            raise TypeError(f"expected a str, got {type(text).__name__}")
+        parts = _parse_interval(text.strip())
+        if parts is None:
+            raise ValueError(f"{text!r} is not an ISO-8601 interval, such as P1DT2H or PT0S")
+        months, days, micros = parts
+        if not (
+            _INT32_MIN <= months <= _INT32_MAX
+            and _INT32_MIN <= days <= _INT32_MAX
+            and _INT64_MIN <= micros <= _INT64_MAX
+        ):
+            raise OverflowError(f"the interval {text!r} is outside the range of an interval")
+        return cls(months, days, micros)
+
+    def __str__(self) -> str:
+        """The ISO-8601 text of this interval, in the form the server writes.
+
+        The years and the months share the sign of the months part, and the hours, minutes and
+        seconds share the sign of the time part. A zero interval is ``PT0S``.
+        """
+        if self.months == 0 and self.days == 0 and self.microseconds == 0:
+            return "PT0S"
+        out = ["P"]
+        years, months = _divmod_toward_zero(self.months, 12)
+        if years:
+            out.append(f"{years}Y")
+        if months:
+            out.append(f"{months}M")
+        if self.days:
+            out.append(f"{self.days}D")
+        if self.microseconds:
+            sign = "-" if self.microseconds < 0 else ""
+            hours, rest = divmod(abs(self.microseconds), _MICROS_PER_HOUR)
+            minutes, rest = divmod(rest, _MICROS_PER_MINUTE)
+            seconds, fraction = divmod(rest, _MICROS_PER_SECOND)
+            out.append("T")
+            if hours:
+                out.append(f"{sign}{hours}H")
+            if minutes:
+                out.append(f"{sign}{minutes}M")
+            if seconds or fraction:
+                out.append(f"{sign}{seconds}")
+                if fraction:
+                    out.append("." + f"{fraction:06d}".rstrip("0"))
+                out.append("S")
+        return "".join(out)
+
+
+def _divmod_toward_zero(value: int, divisor: int) -> tuple[int, int]:
+    quotient, remainder = divmod(abs(value), divisor)
+    return (-quotient, -remainder) if value < 0 else (quotient, remainder)
+
+
+_ISO_DIGITS = frozenset("0123456789.")
+
+
+def _parse_interval(text: str) -> tuple[int, int, int] | None:
+    """The months, the days and the microseconds of ISO-8601 interval text, or ``None``."""
+    if len(text) < 2 or text[0] not in "Pp":
+        return None
+    months = days = micros = decimal.Decimal(0)
+    time_part = any_part = any_time = False
+    i, n = 1, len(text)
+    with decimal.localcontext(_INTERVAL_CONTEXT):
+        while i < n:
+            if text[i] in "Tt":
+                if time_part:
+                    return None
+                time_part = True
+                i += 1
+                continue
+            start = i
+            if text[i] in "+-":
+                i += 1
+            while i < n and text[i] in _ISO_DIGITS:
+                i += 1
+            if i >= n:
+                return None
+            try:
+                number = decimal.Decimal(text[start:i])
+            except decimal.InvalidOperation:
+                return None
+            designator = text[i].upper()
+            i += 1
+            whole = number == number.to_integral_value()
+            if not time_part and whole and designator == "Y":
+                months += number * 12
+            elif not time_part and whole and designator == "M":
+                months += number
+            elif not time_part and whole and designator == "W":
+                days += number * 7
+            elif not time_part and whole and designator == "D":
+                days += number
+            elif time_part and whole and designator == "H":
+                micros += number * _MICROS_PER_HOUR
+            elif time_part and whole and designator == "M":
+                micros += number * _MICROS_PER_MINUTE
+            elif time_part and designator == "S":
+                micros += number * _MICROS_PER_SECOND
+            else:
+                return None
+            any_part = True
+            any_time = any_time or time_part
+        # A "T" must have at least one time designator after it.
+        if not any_part or (time_part and not any_time):
+            return None
+        rounded = micros.to_integral_value(rounding=decimal.ROUND_HALF_EVEN)
+    return int(months), int(days), int(rounded)
 
 
 _OBJECT_ID = re.compile(r"[0-9a-fA-F]{24}")

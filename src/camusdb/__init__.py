@@ -51,6 +51,7 @@ from .types import (
     ColumnType,
     Date,
     DateFromTicks,
+    Interval,
     IsolationLevel,
     Locking,
     ObjectId,
@@ -61,7 +62,7 @@ from .types import (
     Typed,
 )
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 # PEP 249 module globals.
 apilevel = "2.0"
@@ -96,6 +97,7 @@ __all__ = [
     "IntegrityError",
     "InterfaceError",
     "InternalError",
+    "Interval",
     "IsolationLevel",
     "Locking",
     "MemoryStats",

@@ -28,6 +28,7 @@ The driver never puts a value into the SQL text. The server receives each value 
 | `uuid.UUID` | `UUID` |
 | `list`, `tuple` | `ARRAY` |
 | `dict` | `JSONB`. See [JSONB](#jsonb). |
+| `datetime.timedelta`, `camusdb.Interval` | `STRING` that holds interval text. See [INTERVAL](#interval). |
 
 Results come back with the same Python types. An `OID` comes back as a `str`, and a `FLOAT32` comes
 back as a `float`.
@@ -54,6 +55,42 @@ To make a new object id in Python, use `camusdb.ObjectId.generate()`.
 `"NaN"`. In a `FLOAT64` or `FLOAT32` cell or array element, the driver reads these three strings as
 the float value. Any other string stays a `str`. A server that is older than the PostgreSQL float
 rule cannot return these values, and it refuses them in a parameter.
+
+## INTERVAL
+
+An interval is a span of months, days and microseconds, as in PostgreSQL. The server must be from
+2026-11-13 or later. An interval is a value of an expression only: no column, array element or
+stored value can be an interval. Use it for date arithmetic, for example
+`created > now() - INTERVAL '7 days'` or `finished - started`.
+
+- A result interval comes back as ISO-8601 text (`P1DT2H`, `P-7D`, `PT0S`) in a `STRING` column, so
+  the cell is a `str`.
+- `camusdb.Interval.parse(text)` reads the text. An `Interval` has the `months`, `days` and
+  `microseconds` parts. `str()` gives the ISO-8601 text.
+- `Interval.to_timedelta()` gives a `datetime.timedelta`. A `timedelta` has no months, so an interval
+  with a month part (for example from `age(a, b)`) causes a `ValueError`.
+- A `timedelta` or an `Interval` parameter binds as its ISO-8601 text. The server does not read text
+  as an interval by itself, so cast the parameter: `CAST(@p AS interval)`. The server rounds the
+  seconds to a microsecond.
+- The driver refuses a list of `timedelta` values, because the server has no interval elements. To
+  bind the text of each element, use
+  `Typed(value, ColumnType.ARRAY, element_type=ColumnType.STRING)`.
+- Two `Interval` values are equal when their three parts are equal. The server compares two
+  intervals by one total, where a month is 30 days, so `INTERVAL 'P1M' = INTERVAL 'P30D'` is true on
+  the server.
+
+```python
+import datetime as dt
+
+from camusdb import Interval
+
+cur = conn.execute(
+    "SELECT name, finished - started FROM jobs WHERE finished - started > CAST(@limit AS interval)",
+    {"limit": dt.timedelta(hours=1)},
+)
+for name, length in cur:
+    print(name, Interval.parse(length).to_timedelta())  # P1DT3H -> 1 day, 3:00:00
+```
 
 ## JSONB
 

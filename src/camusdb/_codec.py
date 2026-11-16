@@ -19,7 +19,7 @@ from typing import Any
 
 from . import _jsonb, codes
 from .errors import DataError, InterfaceError, ProgrammingError
-from .types import ColumnType, ObjectId, Typed
+from .types import ColumnType, Interval, ObjectId, Typed
 
 WireValue = dict[str, Any]
 
@@ -93,6 +93,10 @@ def infer_type(name: str, value: Any) -> ColumnType:
         return ColumnType.NUMERIC
     if isinstance(value, str):
         return ColumnType.STRING
+    # An interval has no wire type: it binds as its ISO-8601 text, and the SQL casts it with
+    # CAST(@p AS interval).
+    if isinstance(value, (dt.timedelta, Interval)):
+        return ColumnType.STRING
     if isinstance(value, (bytes, bytearray, memoryview)):
         return ColumnType.BYTES
     # datetime before date: a datetime is a date in Python.
@@ -129,6 +133,9 @@ def _encode_as(
             case ColumnType.STRING:
                 if isinstance(value, str):
                     text = value
+                elif isinstance(value, dt.timedelta):
+                    # str() gives "1 day, 2:00:00", which the server does not read as an interval.
+                    text = str(Interval.from_timedelta(value))
                 elif isinstance(value, (Mapping, list, tuple)):
                     # A document bound as a STRING is its JSON text, and not the Python repr.
                     text = _jsonb.to_text(value)
@@ -181,6 +188,14 @@ def _encode_array(name: str, value: Any, element_type: ColumnType | None) -> Wir
 
     if element_type is None:
         first = next((item for item in items if item is not None), None)
+        if isinstance(first, (dt.timedelta, Interval)):
+            # The server has no interval elements, so no element type is inferred.
+            raise ProgrammingError(
+                f"cannot infer the element type of array parameter {name!r}: an interval cannot be "
+                "an array element; to bind the ISO-8601 text of each element, use "
+                "camusdb.Typed(value, ColumnType.ARRAY, element_type=ColumnType.STRING)",
+                codes.INVALID_INPUT,
+            )
         if first is not None:
             element_type = infer_type(name, first)
             # The server has no ARRAY(NUMERIC): a Decimal element travels as a FLOAT64.

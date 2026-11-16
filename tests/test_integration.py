@@ -359,3 +359,59 @@ def test_jsonb(endpoint, database):
             {"doc": Typed("null", ColumnType.JSONB)},
         )
         assert cur.fetchall() == [("null",)]
+
+
+def test_interval(endpoint, database):
+    started = dt.datetime(2024, 1, 31, 10, 0, 0, tzinfo=dt.timezone.utc)
+    finished = dt.datetime(2024, 2, 1, 13, 30, 15, 250_000, tzinfo=dt.timezone.utc)
+    span = dt.timedelta(days=1, hours=2, minutes=3, seconds=4, microseconds=123_457)
+    name = "i_" + uuid.uuid4().hex[:10]
+    with camusdb.connect(endpoint=endpoint, database=database, autocommit=True) as conn:
+        cur = conn.execute(
+            "SELECT CAST(@span AS interval) AS span, "
+            "CAST(@finished AS datetime) - CAST(@started AS datetime) AS elapsed, "
+            "age(CAST('2001-04-10' AS date), CAST('1957-06-13' AS date)) AS age, "
+            "CAST(@started AS datetime) + CAST(@span AS interval) AS moved, "
+            "CAST(@interval AS interval) AS months",
+            {
+                "span": span,
+                "started": started,
+                "finished": finished,
+                "interval": camusdb.Interval(14, -3, 5_000_000),
+            },
+        )
+        assert cur.description[0][1] == ColumnType.STRING
+        row = cur.fetchone()
+        assert row[0] == "P1DT2H3M4.123457S"
+        assert camusdb.Interval.parse(row[0]).to_timedelta() == span
+        assert camusdb.Interval.parse(row[1]).to_timedelta() == finished - started
+        assert camusdb.Interval.parse(row[2]) == camusdb.Interval(525, 27, 0)
+        assert row[3] == started + span
+        assert camusdb.Interval.parse(row[4]) == camusdb.Interval(14, -3, 5_000_000)
+
+        streamed = list(
+            conn.cursor().stream(
+                "SELECT CAST(@a AS interval) * 1.5, -CAST(@a AS interval)",
+                {"a": dt.timedelta(days=1, hours=2)},
+            )
+        )
+        assert streamed == [("P1DT15H", "P-1DT-2H")]
+
+        conn.execute(
+            f"CREATE TABLE {name} (id INT64 PRIMARY KEY NOT NULL, name STRING NOT NULL, "
+            "started DATETIME NOT NULL, finished DATETIME NOT NULL)"
+        )
+        for i, (job, length) in enumerate(
+            [("short", dt.timedelta(minutes=5)), ("long", dt.timedelta(hours=3))]
+        ):
+            conn.execute(
+                f"INSERT INTO {name} (id, name, started, finished) "
+                "VALUES (@id, @name, @started, @finished)",
+                {"id": i, "name": job, "started": started, "finished": started + length},
+            )
+        cur = conn.execute(
+            f"SELECT name, finished - started FROM {name} "
+            "WHERE finished - started > CAST(@limit AS interval)",
+            {"limit": dt.timedelta(hours=1)},
+        )
+        assert cur.fetchall() == [("long", "PT3H")]
