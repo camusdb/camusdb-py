@@ -24,7 +24,7 @@ from ._base import (
 )
 from ._codec import encode_row
 from ._config import Config, build_config
-from ._protocol import Branch
+from ._protocol import Branch, HlcTimestamp
 from ._transport import Transport
 from .errors import DatabaseError, Error, InterfaceError, InternalError, ProgrammingError
 from .retry import is_retryable
@@ -126,7 +126,8 @@ class Connection:
                 codes.UNKNOWN,
             )
         try:
-            self._finalize(proto.COMMIT_TRANSACTION, txn)
+            body = self._finalize(proto.COMMIT_TRANSACTION, txn)
+            state.commit_timestamp = proto.parse_commit_timestamp(body)
         finally:
             state.end_transaction()
 
@@ -245,6 +246,24 @@ class Connection:
     def transaction_id(self) -> str | None:
         """The id of the current transaction, as ``"pt:counter"``, or None."""
         return self._state.txn.id if self._state.txn is not None else None
+
+    @property
+    def commit_timestamp(self) -> HlcTimestamp | None:
+        """The commit timestamp of the connection's last transaction, or None.
+
+        This is the hybrid logical clock timestamp that the server gives to every write of the
+        transaction. A successful :meth:`commit` sets it, also the commit at the end of a
+        :meth:`transaction` block. It is None in these cases:
+
+        * the connection did not commit a transaction yet, or a transaction is open,
+        * the last transaction rolled back, or its commit failed,
+        * the last transaction wrote nothing,
+        * the server is older than 0.18.4.
+
+        A statement that runs outside a transaction does not change it. Two transactions that write the
+        same row are in commit-timestamp order. Other transactions do not always have this order.
+        """
+        return self._state.commit_timestamp
 
     @property
     def in_transaction(self) -> bool:
@@ -411,8 +430,9 @@ class Connection:
             endpoint=endpoint,
             fallback="start transaction failed",
         )
-        state.txn = proto.parse_start_transaction(body, endpoint)
-        return state.txn
+        txn = proto.parse_start_transaction(body, endpoint)
+        state.begin_transaction(txn)
+        return txn
 
     def _transaction_for(self, plan: Plan) -> proto.TransactionHandle | None:
         state = self._state
@@ -422,16 +442,16 @@ class Connection:
         plan.check_transaction(state.txn)
         return state.txn
 
-    def _finalize(self, path: str, txn: proto.TransactionHandle) -> None:
+    def _finalize(self, path: str, txn: proto.TransactionHandle) -> dict[str, Any]:
         body = proto.finalize_body(self._state.database, txn)
         fallback = "commit failed" if path == proto.COMMIT_TRANSACTION else "rollback failed"
         for attempt in range(MAX_FINALIZE_ATTEMPTS + 1):
             try:
-                proto.expect_ok(
-                    self._transport.post(path, body, endpoint=txn.endpoint, fallback=fallback),
-                    fallback,
+                response = self._transport.post(
+                    path, body, endpoint=txn.endpoint, fallback=fallback
                 )
-                return
+                proto.expect_ok(response, fallback)
+                return response
             except DatabaseError as exc:
                 if (
                     exc.code != codes.TRANSACTION_FINALIZE_UNRESOLVED
@@ -439,6 +459,7 @@ class Connection:
                 ):
                     raise
                 time.sleep(finalize_delay(attempt))
+        raise AssertionError("unreachable")
 
     def _run(self, plan: Plan) -> proto.Result:
         txn = self._transaction_for(plan)

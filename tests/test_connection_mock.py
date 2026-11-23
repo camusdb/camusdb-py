@@ -164,6 +164,163 @@ def test_an_unresolved_commit_is_sent_again(server, connect, monkeypatch):
     assert server.paths().count("/commit-transaction") == 3
 
 
+COMMIT_TIMESTAMP = {"n": 2, "l": 1795124033385, "c": 7}
+
+
+def test_a_commit_reports_its_timestamp(server, connect):
+    server.handlers["/commit-transaction"] = lambda body, req: {
+        "status": "ok",
+        "causalToken": {"n": 1, "l": 1795124033390, "c": 0},
+        "commitTimestamp": COMMIT_TIMESTAMP,
+    }
+    conn = connect()
+    assert conn.commit_timestamp is None
+    conn.execute("UPDATE t SET a = 1")
+    conn.commit()
+    assert conn.commit_timestamp == camusdb.HlcTimestamp(l=1795124033385, c=7, n=2)
+    assert str(conn.commit_timestamp) == "HLC(2:1795124033385:7)"
+
+    # A commit with no transaction, and a statement outside a transaction, do not change it.
+    conn.commit()
+    conn.autocommit = True
+    conn.execute("UPDATE t SET a = 1")
+    assert conn.commit_timestamp is not None
+
+    # A new transaction clears it, and a rollback does not set it.
+    conn.autocommit = False
+    conn.execute("UPDATE t SET a = 1")
+    assert conn.commit_timestamp is None
+    conn.rollback()
+    assert conn.commit_timestamp is None
+
+    with conn.transaction():
+        conn.execute("UPDATE t SET a = 1")
+    conn.close()
+    assert conn.commit_timestamp is not None
+
+
+@pytest.mark.anyio
+async def test_an_async_commit_reports_its_timestamp(server, monkeypatch):
+    import camusdb.aio
+
+    monkeypatch.setattr("camusdb.aio.connection.finalize_delay", lambda attempt: 0)
+    answers = iter(
+        [
+            failure("CADB0509"),
+            {"status": "ok", "commitTimestamp": COMMIT_TIMESTAMP},
+            {"status": "ok"},
+        ]
+    )
+    server.handlers["/commit-transaction"] = lambda body, req: next(answers)
+    conn = await camusdb.aio.connect(endpoint="http://localhost:9110", database="test")
+    conn._transport._client = httpx.AsyncClient(transport=httpx.MockTransport(server))
+    try:
+        await conn.execute("UPDATE t SET a = 1")
+        await conn.commit()
+        assert conn.commit_timestamp == camusdb.HlcTimestamp(1795124033385, 7, 2)
+        # An older server sends no field.
+        async with conn.transaction():
+            assert conn.commit_timestamp is None
+        assert conn.commit_timestamp is None
+    finally:
+        await conn.close()
+
+
+def test_a_rollback_answer_gives_no_commit_timestamp(server, connect):
+    server.handlers["/rollback-transaction"] = lambda body, req: {
+        "status": "ok",
+        "commitTimestamp": COMMIT_TIMESTAMP,
+    }
+    conn = connect()
+    conn.execute("UPDATE t SET a = 1")
+    conn.rollback()
+    assert conn.commit_timestamp is None
+
+
+def test_a_failed_commit_gives_no_commit_timestamp(server, connect):
+    server.handlers["/commit-transaction"] = lambda body, req: failure("CADB0502")
+    conn = connect()
+    conn.execute("UPDATE t SET a = 1")
+    with pytest.raises(camusdb.SerializationFailure):
+        conn.commit()
+    assert conn.commit_timestamp is None
+
+
+def test_a_commit_sent_again_reports_the_commit_that_landed(server, connect, monkeypatch):
+    monkeypatch.setattr("camusdb.connection.finalize_delay", lambda attempt: 0)
+    answers = iter([failure("CADB0509"), {"status": "ok", "commitTimestamp": COMMIT_TIMESTAMP}])
+    server.handlers["/commit-transaction"] = lambda body, req: next(answers)
+    conn = connect()
+    conn.execute("UPDATE t SET a = 1")
+    conn.commit()
+    assert conn.commit_timestamp == camusdb.HlcTimestamp(1795124033385, 7, 2)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        {"n": 0, "l": 0, "c": 0},
+        {"n": 1, "l": 5},
+        {"n": 1, "l": "5", "c": 0},
+        {"n": 1, "l": 5, "c": True},
+        {"n": 1, "l": 5.5, "c": 0},
+        [1, 2, 3],
+        "HLC(1:2:3)",
+    ],
+)
+def test_a_commit_without_a_usable_timestamp_still_succeeds(server, connect, value):
+    server.handlers["/commit-transaction"] = lambda body, req: {
+        "status": "ok",
+        "commitTimestamp": value,
+    }
+    conn = connect()
+    conn.execute("UPDATE t SET a = 1")
+    conn.commit()
+    assert conn.commit_timestamp is None
+    assert not conn.in_transaction
+
+
+def test_hlc_timestamps_compare_by_time_then_counter_then_node():
+    def hlc(n, l, c):  # noqa: E741
+        return camusdb.HlcTimestamp(l=l, c=c, n=n)
+
+    ordered = [hlc(9, 100, 9), hlc(1, 100, 10), hlc(0, 101, 0), hlc(2, 101, 0)]
+    assert sorted(reversed(ordered)) == ordered
+    assert hlc(1, 5, 2) == hlc(1, 5, 2)
+    assert hlc(1, 5, 2) != hlc(2, 5, 2)
+    assert len({hlc(1, 5, 2), hlc(1, 5, 2), hlc(2, 5, 2)}) == 2
+
+
+def test_ddl_in_a_transaction_carries_the_transaction(server, connect):
+    conn = connect()
+    with conn.transaction():
+        conn.execute("CREATE TABLE t (id INT64 PRIMARY KEY NOT NULL)")
+    assert server.paths() == ["/start-transaction", "/execute-sql-ddl", "/commit-transaction"]
+    assert server.requests[1][1]["txnIdPT"] == 1001
+
+
+def test_ddl_that_the_server_refuses_aborts_the_transaction(server, connect):
+    server.handlers["/execute-sql-ddl"] = lambda body, req: failure("CADB0538")
+    conn = connect()
+    with pytest.raises(camusdb.ProgrammingError) as info, conn.transaction():
+        conn.execute("ALTER TABLE t REWRITE STORAGE")
+    assert info.value.code == codes.STATEMENT_NOT_ALLOWED_IN_TRANSACTION
+    assert server.paths()[-1] == "/rollback-transaction"
+
+
+def test_refresh_opens_no_transaction(server, connect):
+    conn = connect()
+    conn.execute("REFRESH MATERIALIZED VIEW v")
+    assert server.paths() == ["/execute-sql-non-query"]
+    assert not conn.in_transaction
+
+    # In an open transaction it carries the transaction, and the server decides.
+    conn.execute("SELECT 1")
+    conn.execute("REFRESH MATERIALIZED VIEW v")
+    assert server.requests[-1][1]["txnIdPT"] == 1001
+
+
 def test_the_transaction_block(server, connect):
     conn = connect(autocommit=True)
     with conn.transaction(read_only=True):

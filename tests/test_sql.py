@@ -5,6 +5,7 @@ from camusdb._sql import (
     classify,
     has_returning,
     is_dml,
+    is_refresh,
     keywords,
     runs_in_own_transaction,
 )
@@ -165,6 +166,12 @@ def test_a_writable_cte_is_a_write(sql):
 )
 def test_a_reading_cte_is_not_a_write(sql):
     assert not is_dml(sql)
+
+
+def test_refresh():
+    assert is_refresh("/* c */ refresh materialized view v")
+    assert not is_refresh("CREATE MATERIALIZED VIEW v AS SELECT 1")
+    assert not is_refresh("SELECT refresh FROM materialized")
 
 
 def test_truncate_runs_in_its_own_transaction():

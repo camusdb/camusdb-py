@@ -25,7 +25,7 @@ from ._admin import (
 )
 from ._config import redact as redact_connection_string
 from ._jsonb import format_jsonb
-from ._protocol import Branch
+from ._protocol import Branch, HlcTimestamp
 from .connection import Backups, Connection, Cursor, connect, run_transaction
 from .errors import (
     DatabaseError,
@@ -62,7 +62,7 @@ from .types import (
     Typed,
 )
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 # PEP 249 module globals.
 apilevel = "2.0"
@@ -94,6 +94,7 @@ __all__ = [
     "DateFromTicks",
     "DiskVolumeStats",
     "Error",
+    "HlcTimestamp",
     "IntegrityError",
     "InterfaceError",
     "InternalError",

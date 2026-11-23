@@ -24,7 +24,7 @@ from .._base import (
 )
 from .._codec import encode_row
 from .._config import Config, build_config
-from .._protocol import Branch
+from .._protocol import Branch, HlcTimestamp
 from ..errors import DatabaseError, Error, InterfaceError, InternalError, ProgrammingError
 from ..retry import is_retryable
 from ..rows import RowFactory
@@ -110,7 +110,8 @@ class AsyncConnection:
                 codes.UNKNOWN,
             )
         try:
-            await self._finalize(proto.COMMIT_TRANSACTION, txn)
+            body = await self._finalize(proto.COMMIT_TRANSACTION, txn)
+            state.commit_timestamp = proto.parse_commit_timestamp(body)
         finally:
             state.end_transaction()
 
@@ -224,6 +225,11 @@ class AsyncConnection:
     @property
     def transaction_id(self) -> str | None:
         return self._state.txn.id if self._state.txn is not None else None
+
+    @property
+    def commit_timestamp(self) -> HlcTimestamp | None:
+        """See :attr:`camusdb.Connection.commit_timestamp`."""
+        return self._state.commit_timestamp
 
     @property
     def in_transaction(self) -> bool:
@@ -381,8 +387,9 @@ class AsyncConnection:
             endpoint=endpoint,
             fallback="start transaction failed",
         )
-        state.txn = proto.parse_start_transaction(body, endpoint)
-        return state.txn
+        txn = proto.parse_start_transaction(body, endpoint)
+        state.begin_transaction(txn)
+        return txn
 
     async def _transaction_for(self, plan: Plan) -> proto.TransactionHandle | None:
         state = self._state
@@ -392,18 +399,16 @@ class AsyncConnection:
         plan.check_transaction(state.txn)
         return state.txn
 
-    async def _finalize(self, path: str, txn: proto.TransactionHandle) -> None:
+    async def _finalize(self, path: str, txn: proto.TransactionHandle) -> dict[str, Any]:
         body = proto.finalize_body(self._state.database, txn)
         fallback = "commit failed" if path == proto.COMMIT_TRANSACTION else "rollback failed"
         for attempt in range(MAX_FINALIZE_ATTEMPTS + 1):
             try:
-                proto.expect_ok(
-                    await self._transport.post(
-                        path, body, endpoint=txn.endpoint, fallback=fallback
-                    ),
-                    fallback,
+                response = await self._transport.post(
+                    path, body, endpoint=txn.endpoint, fallback=fallback
                 )
-                return
+                proto.expect_ok(response, fallback)
+                return response
             except DatabaseError as exc:
                 if (
                     exc.code != codes.TRANSACTION_FINALIZE_UNRESOLVED
@@ -411,6 +416,7 @@ class AsyncConnection:
                 ):
                     raise
                 await asyncio.sleep(finalize_delay(attempt))
+        raise AssertionError("unreachable")
 
     async def _run(self, plan: Plan) -> proto.Result:
         txn = await self._transaction_for(plan)

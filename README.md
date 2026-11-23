@@ -39,7 +39,7 @@ with camusdb.connect("Endpoint=http://localhost:5095;Database=test") as conn:
 - [Queries](https://github.com/camusdb/camusdb-py/blob/main/docs/queries.md): parameters, types,
   results and streaming.
 - [Transactions](https://github.com/camusdb/camusdb-py/blob/main/docs/transactions.md): commit,
-  autocommit, isolation and retries.
+  autocommit, schema changes, isolation, retries and the commit timestamp.
 - [Authentication](https://github.com/camusdb/camusdb-py/blob/main/docs/authentication.md): users,
   passwords, tokens and TLS.
 - [Errors](https://github.com/camusdb/camusdb-py/blob/main/docs/errors.md): the exception classes and

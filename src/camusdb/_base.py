@@ -53,6 +53,8 @@ class ConnectionState:
         self.txn: proto.TransactionHandle | None = None
         # True after a statement of the transaction failed. The server discarded the transaction.
         self.txn_failed = False
+        # The commit timestamp of the last transaction, or None.
+        self.commit_timestamp: proto.HlcTimestamp | None = None
 
     # --- Settings ---------------------------------------------------------------------------------
 
@@ -142,6 +144,10 @@ class ConnectionState:
         if self.txn is not None:
             self.txn_failed = True
 
+    def begin_transaction(self, txn: proto.TransactionHandle) -> None:
+        self.txn = txn
+        self.commit_timestamp = None
+
     def end_transaction(self) -> None:
         self.txn = None
         self.txn_failed = False
@@ -171,8 +177,11 @@ class Plan:
 
     @property
     def begins_transaction(self) -> bool:
-        # A schema change commits on its own, so it does not open the implicit transaction.
-        return self.kind is not _sql.StatementKind.DDL
+        # A schema change does not open the implicit transaction: with no transaction open, it commits
+        # on its own. In an open transaction it carries that transaction, and the server setting
+        # transactional_ddl_enabled decides whether it becomes part of it. REFRESH MATERIALIZED VIEW
+        # goes to the non-query endpoint, but the server never makes it part of a transaction.
+        return self.kind is not _sql.StatementKind.DDL and not _sql.is_refresh(self.sql)
 
     def check_transaction(self, txn: proto.TransactionHandle | None) -> None:
         if txn is not None and _sql.runs_in_own_transaction(self.sql):

@@ -239,6 +239,11 @@ def has_returning(sql: str) -> bool:
     return "RETURNING" in keywords(sql)
 
 
+def is_refresh(sql: str) -> bool:
+    """Whether the statement is ``REFRESH MATERIALIZED VIEW``, which commits on its own."""
+    return keywords(sql, limit=2) == ["REFRESH", "MATERIALIZED"]
+
+
 def runs_in_own_transaction(sql: str) -> bool:
     """``TRUNCATE`` commits on its own, so the server refuses it inside a transaction."""
     return keywords(sql, limit=1) == ["TRUNCATE"]

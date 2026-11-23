@@ -85,6 +85,26 @@ class TransactionHandle:
         return f"{self.pt}:{self.counter}"
 
 
+@dataclass(frozen=True, order=True)
+class HlcTimestamp:
+    """A hybrid logical clock (HLC) timestamp of the server: :attr:`Connection.commit_timestamp`.
+
+    It is a wall-clock time plus a logical counter, with which the server orders events. Values compare
+    by ``l``, then ``c``, then ``n``, as they do in the server. ``str()`` gives the server's log format.
+    """
+
+    # The order of the fields is the order of the comparison.
+    l: int  # noqa: E741
+    """The wall-clock time, in milliseconds since the Unix epoch."""
+    c: int
+    """The logical counter."""
+    n: int
+    """The id of the node whose clock made the value. It breaks a tie between two nodes."""
+
+    def __str__(self) -> str:
+        return f"HLC({self.n}:{self.l}:{self.c})"
+
+
 @dataclass(frozen=True)
 class TransactionOptions:
     isolation_level: IsolationLevel | None = None
@@ -207,6 +227,25 @@ def expect_ok(body: Mapping[str, Any], fallback: str) -> None:
 def parse_start_transaction(body: Mapping[str, Any], endpoint: str) -> TransactionHandle:
     expect_ok(body, "start transaction failed")
     return TransactionHandle(int(body["txnIdPT"]), int(body.get("txnIdCounter") or 0), endpoint)
+
+
+def parse_commit_timestamp(body: Mapping[str, Any]) -> HlcTimestamp | None:
+    """The commit timestamp in the answer of a commit, or None when the answer has none.
+
+    The server sends null for a transaction that wrote nothing, and an older server sends no field.
+    The commit is done when this runs, so a malformed value is None too: an error here would tell the
+    caller that the commit failed.
+    """
+    raw = body.get("commitTimestamp")
+    if not isinstance(raw, dict):
+        return None
+    parts = [raw.get(name) for name in ("l", "c", "n")]
+    # A JSON true or false is an int in Python.
+    values = [part for part in parts if isinstance(part, int) and not isinstance(part, bool)]
+    if len(values) != len(parts):
+        return None
+    # The server uses all zeros for "no timestamp".
+    return HlcTimestamp(*values) if any(values) else None
 
 
 @decoder("query")

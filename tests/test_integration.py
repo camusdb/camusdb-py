@@ -1,5 +1,6 @@
 """End-to-end tests against a CamusDB server. Run with CAMUSDB_TEST_ENDPOINT=http://localhost:5095."""
 
+import asyncio
 import datetime as dt
 import decimal
 import uuid
@@ -263,6 +264,68 @@ async def test_async_round_trip(endpoint, database, table):
         conn.autocommit = True
         assert await camusdb.aio.run_transaction(conn, count) == 2
         assert await conn.ping()
+
+
+def test_commit_timestamp(endpoint, database, table):
+    name = "c_" + uuid.uuid4().hex[:10]
+    with camusdb.connect(endpoint=endpoint, database=database, autocommit=True) as conn:
+        conn.execute(f"CREATE TABLE {name} (id INT64 PRIMARY KEY NOT NULL, n INT64)")
+        seen = []
+        for n in range(3):
+            with conn.transaction():
+                conn.execute(f"UPSERT INTO {name} (id, n) VALUES (1, @n)", {"n": n})
+            seen.append(conn.commit_timestamp)
+        if seen[0] is None:
+            pytest.skip("the server is older than the commit timestamp (0.18.4)")
+        # Each transaction wrote the same row, so the commits are in this order.
+        assert seen == sorted(seen)
+        assert len(set(seen)) == 3
+
+        with conn.transaction():
+            conn.execute(f"SELECT n FROM {name}")
+        assert conn.commit_timestamp is None
+
+    async def run():
+        import camusdb.aio
+
+        async with await camusdb.aio.connect(endpoint=endpoint, database=database) as conn:
+            await conn.execute(f"UPDATE {name} SET n = 9 WHERE id = 1")
+            await conn.commit()
+            return conn.commit_timestamp
+
+    assert asyncio.run(run()) > seen[-1]
+
+
+def test_ddl_in_a_transaction(endpoint, database):
+    """With transactional_ddl_enabled on, the rollback undoes the table. With it off, the table stays."""
+    kept, undone = ("d_" + uuid.uuid4().hex[:10] for _ in range(2))
+    with camusdb.connect(endpoint=endpoint, database=database, autocommit=True) as conn:
+        with conn.transaction():
+            conn.execute(f"CREATE TABLE {kept} (id INT64 PRIMARY KEY NOT NULL)")
+            conn.execute(f"INSERT INTO {kept} (id) VALUES (1)")
+        assert conn.execute(f"SELECT id FROM {kept}").fetchall() == [(1,)]
+
+        with pytest.raises(ZeroDivisionError), conn.transaction():
+            conn.execute(f"CREATE TABLE {undone} (id INT64 PRIMARY KEY NOT NULL)")
+            conn.execute(f"INSERT INTO {undone} (id) VALUES (1)")
+            raise ZeroDivisionError
+        try:
+            # Setting off: the table is there, but its row rolled back.
+            assert conn.execute(f"SELECT id FROM {undone}").fetchall() == []
+        except camusdb.ProgrammingError as exc:
+            assert exc.code == codes.TABLE_DOESNT_EXIST
+
+
+def test_refresh_materialized_view(endpoint, database):
+    name = "m_" + uuid.uuid4().hex[:10]
+    with camusdb.connect(endpoint=endpoint, database=database) as conn:
+        conn.execute(f"CREATE TABLE {name} (id INT64 PRIMARY KEY NOT NULL)")
+        conn.execute(f"CREATE MATERIALIZED VIEW {name}_mv AS SELECT id FROM {name}")
+        conn.execute(f"INSERT INTO {name} (id) VALUES (1)")
+        conn.commit()
+        conn.execute(f"REFRESH MATERIALIZED VIEW {name}_mv")
+        assert not conn.in_transaction
+        assert conn.execute(f"SELECT id FROM {name}_mv").fetchall() == [(1,)]
 
 
 def test_node_stats(conn):
